@@ -164,3 +164,10 @@ app.get('/api/recriar-admin', (req, res) => {
 app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
 });
+
+app.delete('/api/categorias/:id', autenticarToken, (req, res) => {
+    db.run(`DELETE FROM categorias WHERE id = ?`, [req.params.id], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'Categoria excluída com sucesso.' });
+    });
+});

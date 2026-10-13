@@ -154,7 +154,13 @@ app.post('/api/categorias', autenticarToken, (req, res) => {
             res.json({ message: 'Categoria atualizada com sucesso.' });
         });
 });
-
+app.get('/api/recriar-admin', (req, res) => {
+    const hash = bcrypt.hashSync('admin123', 10);
+    db.run(`INSERT OR REPLACE INTO usuarios (id, nome, email, senha, nivel) VALUES (1, 'Administrador', 'admin@printaegyn.com.br', ?, 'admin')`, [hash], (err) => {
+        if (err) res.send("Erro: " + err.message);
+        else res.send("Usuário admin recriado com sucesso! Senha: admin123");
+    });
+});
 app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
 });

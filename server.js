@@ -46,6 +46,12 @@ db.serialize(() => {
         imagem TEXT
     )`);
 
+    // Tabela de Configurações (para o Banner Principal e outras configs)
+    db.run(`CREATE TABLE IF NOT EXISTS configuracoes (
+        chave TEXT PRIMARY KEY,
+        valor TEXT
+    )`);
+
     // Criar Admin Padrão se não existir
     db.get(`SELECT * FROM usuarios WHERE email = ?`, ['admin@printaegyn.com.br'], (err, user) => {
         if (!user) {
@@ -154,6 +160,32 @@ app.post('/api/categorias', autenticarToken, (req, res) => {
             res.json({ message: 'Categoria atualizada com sucesso.' });
         });
 });
+
+app.delete('/api/categorias/:id', autenticarToken, (req, res) => {
+    db.run(`DELETE FROM categorias WHERE id = ?`, [req.params.id], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'Categoria excluída com sucesso.' });
+    });
+});
+
+// --- ROTAS DE CONFIGURAÇÕES (BANNER PRINCIPAL) ---
+app.get('/api/configuracoes/:chave', (req, res) => {
+    db.get(`SELECT valor FROM configuracoes WHERE chave = ?`, [req.params.chave], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ valor: row ? row.valor : null });
+    });
+});
+
+app.post('/api/configuracoes', autenticarToken, (req, res) => {
+    const { chave, valor } = req.body;
+    db.run(`INSERT INTO configuracoes (chave, valor) VALUES (?, ?) ON CONFLICT(chave) DO UPDATE SET valor = ?`,
+        [chave, valor, valor], function(err) {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ message: 'Configuração salva com sucesso.' });
+        });
+});
+
+// --- ROTA DE EMERGÊNCIA PARA RECRIAR ADMIN ---
 app.get('/api/recriar-admin', (req, res) => {
     const hash = bcrypt.hashSync('admin123', 10);
     db.run(`INSERT OR REPLACE INTO usuarios (id, nome, email, senha, nivel) VALUES (1, 'Administrador', 'admin@printaegyn.com.br', ?, 'admin')`, [hash], (err) => {
@@ -161,13 +193,7 @@ app.get('/api/recriar-admin', (req, res) => {
         else res.send("Usuário admin recriado com sucesso! Senha: admin123");
     });
 });
+
 app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
-});
-
-app.delete('/api/categorias/:id', autenticarToken, (req, res) => {
-    db.run(`DELETE FROM categorias WHERE id = ?`, [req.params.id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Categoria excluída com sucesso.' });
-    });
 });

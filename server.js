@@ -1,199 +1,269 @@
 const express = require('express');
-const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const SECRET_KEY = process.env.SECRET_KEY || 'chave-secreta-padrao-local';
+const JWT_SECRET = process.env.JWT_SECRET || 'printae_secret_key_2026';
 
-// Aumenta o limite de payload para permitir o upload de imagens em Base64
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(cors());
+app.use(express.json({ limit: '50mb' }));
 
-// Conexão e Inicialização do Banco de Dados SQLite
-const db = new sqlite3.Database('./printae.db', (err) => {
-    if (err) console.error("Erro ao conectar ao SQLite:", err.message);
-    else console.log("Conectado ao banco SQLite com sucesso.");
+const db = new sqlite3.Database('./database.db', (err) => {
+  if (err) console.error("Erro ao abrir banco SQLite:", err.message);
+  else console.log("Banco SQLite conectado com sucesso.");
 });
 
+// CRIAÇÃO E MIGRAÇÃO DAS TABELAS
 db.serialize(() => {
-    // Tabela de Usuários
-    db.run(`CREATE TABLE IF NOT EXISTS usuarios (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nome TEXT,
-        email TEXT UNIQUE,
-        senha TEXT,
-        nivel TEXT DEFAULT 'admin'
-    )`);
+  // Configurações gerais (banner hero, sobre nos, logo)
+  db.run(`CREATE TABLE IF NOT EXISTS configuracoes (chave TEXT PRIMARY KEY, valor TEXT)`);
 
-    // Tabela de Produtos
-    db.run(`CREATE TABLE IF NOT EXISTS produtos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nome TEXT,
-        preco REAL,
-        categoria TEXT,
-        descricao TEXT,
-        imagem TEXT
-    )`);
+  // Banners Adicionais Rotativos
+  db.run(`CREATE TABLE IF NOT EXISTS banners (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    imagem TEXT NOT NULL,
+    link TEXT,
+    ordem INTEGER DEFAULT 0
+  )`);
 
-    // Tabela de Categorias (com imagem)
-    db.run(`CREATE TABLE IF NOT EXISTS categorias (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nome TEXT UNIQUE,
-        imagem TEXT
-    )`);
+  // Categorias
+  db.run(`CREATE TABLE IF NOT EXISTS categorias (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT UNIQUE NOT NULL,
+    imagem TEXT
+  )`);
 
-    // Tabela de Configurações (para o Banner Principal e outras configs)
-    db.run(`CREATE TABLE IF NOT EXISTS configuracoes (
-        chave TEXT PRIMARY KEY,
-        valor TEXT
-    )`);
+  // Produtos
+  db.run(`CREATE TABLE IF NOT EXISTS produtos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    preco REAL NOT NULL,
+    categoria TEXT NOT NULL,
+    descricao TEXT,
+    imagem TEXT,
+    imagens TEXT
+  )`);
 
-    // Criar Admin Padrão se não existir
-    db.get(`SELECT * FROM usuarios WHERE email = ?`, ['admin@printaegyn.com.br'], (err, user) => {
-        if (!user) {
-            const hash = bcrypt.hashSync('admin123', 10);
-            db.run(`INSERT INTO usuarios (nome, email, senha, nivel) VALUES (?, ?, ?, ?)`,
-                ['Administrador', 'admin@printaegyn.com.br', hash, 'admin']);
-        }
-    });
+  // Cargos e Permissões
+  db.run(`CREATE TABLE IF NOT EXISTS cargos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT UNIQUE NOT NULL,
+    permissoes TEXT NOT NULL
+  )`);
+
+  // Usuários Administradores
+  db.run(`CREATE TABLE IF NOT EXISTS usuarios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    usuario TEXT UNIQUE NOT NULL,
+    senha TEXT NOT NULL,
+    is_master INTEGER DEFAULT 0,
+    cargo_id INTEGER,
+    FOREIGN KEY(cargo_id) REFERENCES cargos(id)
+  )`);
+
+  // Cria Admin Master Inicial Padrão se não existir
+  db.get(`SELECT * FROM usuarios WHERE is_master = 1`, (err, master) => {
+    if (!master) {
+      db.run(`INSERT INTO usuarios (usuario, senha, is_master) VALUES ('admin', 'admin123', 1)`);
+    }
+  });
 });
 
-// Middleware de Autenticação JWT
+// MIDDLEWARE DE AUTENTICAÇÃO JWT
 function autenticarToken(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Acesso negado. Token não fornecido.' });
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(01).json({ error: 'Acesso negado. Token não fornecido.' });
 
-    jwt.verify(token, SECRET_KEY, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
-        req.user = user;
-        next();
-    });
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
+    req.user = user;
+    next();
+  });
 }
 
-// --- ROTAS DE AUTENTICAÇÃO ---
+// ROTAS DE AUTENTICAÇÃO E CONFIGS
 app.post('/api/login', (req, res) => {
-    const { email, senha } = req.body;
-    db.get(`SELECT * FROM usuarios WHERE email = ?`, [email], (err, user) => {
-        if (err || !user) return res.status(400).json({ error: 'E-mail ou senha incorretos.' });
-        if (!bcrypt.compareSync(senha, user.senha)) return res.status(400).json({ error: 'E-mail ou senha incorretos.' });
+  const { usuario, senha } = req.body;
+  db.get(
+    `SELECT u.*, c.permissoes FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id WHERE u.usuario = ? AND u.senha = ?`,
+    [usuario, senha],
+    (err, user) => {
+      if (err || !user) return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
+      
+      const permissoesArray = user.is_master ? ['all'] : (user.permissoes ? JSON.parse(user.permissoes) : []);
+      const token = jwt.sign({ id: user.id, usuario: user.usuario, is_master: user.is_master, permissoes: permissoesArray }, JWT_SECRET, { expiresIn: '12h' });
+      
+      res.json({ token, usuario: user.usuario, is_master: !!user.is_master, permissoes: permissoesArray });
+    }
+  );
+});
 
-        const token = jwt.sign({ id: user.id, email: user.email }, SECRET_KEY, { expiresIn: '8h' });
-        res.json({ message: 'Login realizado com sucesso', token, usuario: { nome: user.nome, email: user.email } });
+// CONFIGURAÇÕES GERAIS (Hero Banner, Sobre Nós, Logo)
+app.get('/api/configuracoes', (req, res) => {
+  db.all(`SELECT * FROM configuracoes`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    const configObj = {};
+    rows.forEach(r => {
+      try { configObj[r.chave] = JSON.parse(r.valor); }
+      catch(e) { configObj[r.chave] = r.valor; }
     });
-});
-
-// --- ROTAS DE GESTÃO DE USUÁRIOS ---
-app.get('/api/usuarios', autenticarToken, (req, res) => {
-    db.all(`SELECT id, nome, email, nivel FROM usuarios`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-
-app.post('/api/usuarios', autenticarToken, (req, res) => {
-    const { nome, email, senha } = req.body;
-    const hash = bcrypt.hashSync(senha, 10);
-    db.run(`INSERT INTO usuarios (nome, email, senha) VALUES (?, ?, ?)`, [nome, email, hash], function(err) {
-        if (err) return res.status(400).json({ error: 'E-mail já cadastrado.' });
-        res.json({ id: this.lastID, nome, email });
-    });
-});
-
-app.delete('/api/usuarios/:id', autenticarToken, (req, res) => {
-    db.run(`DELETE FROM usuarios WHERE id = ?`, [req.params.id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Usuário removido com sucesso.' });
-    });
-});
-
-// --- ROTAS DE PRODUTOS ---
-app.get('/api/produtos', (req, res) => {
-    db.all(`SELECT * FROM produtos`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-
-app.post('/api/produtos', autenticarToken, (req, res) => {
-    const { nome, preco, categoria, descricao, imagem } = req.body;
-    db.run(`INSERT INTO produtos (nome, preco, categoria, descricao, imagem) VALUES (?, ?, ?, ?, ?)`,
-        [nome, preco, categoria, descricao, imagem], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ id: this.lastID, nome, preco, categoria, descricao, imagem });
-        });
-});
-
-app.put('/api/produtos/:id', autenticarToken, (req, res) => {
-    const { nome, preco, categoria, descricao, imagem } = req.body;
-    db.run(`UPDATE produtos SET nome = ?, preco = ?, categoria = ?, descricao = ?, imagem = COALESCE(?, imagem) WHERE id = ?`,
-        [nome, preco, categoria, descricao, imagem, req.params.id], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ message: 'Produto atualizado com sucesso.' });
-        });
-});
-
-app.delete('/api/produtos/:id', autenticarToken, (req, res) => {
-    db.run(`DELETE FROM produtos WHERE id = ?`, [req.params.id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Produto excluído com sucesso.' });
-    });
-});
-
-// --- ROTAS DE CATEGORIAS ---
-app.get('/api/categorias', (req, res) => {
-    db.all(`SELECT * FROM categorias`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-
-app.post('/api/categorias', autenticarToken, (req, res) => {
-    const { nome, imagem } = req.body;
-    db.run(`INSERT INTO categorias (nome, imagem) VALUES (?, ?) ON CONFLICT(nome) DO UPDATE SET imagem = ?`,
-        [nome, imagem, imagem], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ message: 'Categoria atualizada com sucesso.' });
-        });
-});
-
-app.delete('/api/categorias/:id', autenticarToken, (req, res) => {
-    db.run(`DELETE FROM categorias WHERE id = ?`, [req.params.id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Categoria excluída com sucesso.' });
-    });
-});
-
-// --- ROTAS DE CONFIGURAÇÕES (BANNER PRINCIPAL) ---
-app.get('/api/configuracoes/:chave', (req, res) => {
-    db.get(`SELECT valor FROM configuracoes WHERE chave = ?`, [req.params.chave], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ valor: row ? row.valor : null });
-    });
+    res.json(configObj);
+  });
 });
 
 app.post('/api/configuracoes', autenticarToken, (req, res) => {
-    const { chave, valor } = req.body;
-    db.run(`INSERT INTO configuracoes (chave, valor) VALUES (?, ?) ON CONFLICT(chave) DO UPDATE SET valor = ?`,
-        [chave, valor, valor], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ message: 'Configuração salva com sucesso.' });
-        });
+  const { chave, valor } = req.body;
+  const valorStr = typeof valor === 'object' ? JSON.stringify(valor) : valor;
+  db.run(
+    `INSERT INTO configuracoes (chave, valor) VALUES (?, ?) ON CONFLICT(chave) DO UPDATE SET valor = ?`,
+    [chave, valorStr, valorStr],
+    (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Configuração salva com sucesso!' });
+    }
+  );
 });
 
-// --- ROTA DE EMERGÊNCIA PARA RECRIAR ADMIN ---
-app.get('/api/recriar-admin', (req, res) => {
-    const hash = bcrypt.hashSync('admin123', 10);
-    db.run(`INSERT OR REPLACE INTO usuarios (id, nome, email, senha, nivel) VALUES (1, 'Administrador', 'admin@printaegyn.com.br', ?, 'admin')`, [hash], (err) => {
-        if (err) res.send("Erro: " + err.message);
-        else res.send("Usuário admin recriado com sucesso! Senha: admin123");
-    });
+// BANNERS ADICIONAIS ROTATIVOS
+app.get('/api/banners', (req, res) => {
+  db.all(`SELECT * FROM banners ORDER BY ordem ASC, id DESC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
 });
 
-app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
+app.post('/api/banners', autenticarToken, (req, res) => {
+  const { imagem, link, ordem } = req.body;
+  db.run(`INSERT INTO banners (imagem, link, ordem) VALUES (?, ?, ?)`, [imagem, link || '', ordem || 0], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ id: this.lastID, message: 'Banner adicionado!' });
+  });
 });
+
+app.delete('/api/banners/:id', autenticarToken, (req, res) => {
+  db.run(`DELETE FROM banners WHERE id = ?`, [req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'Banner removido com sucesso!' });
+  });
+});
+
+// CATEGORIAS (CRUD Completo)
+app.get('/api/categorias', (req, res) => {
+  db.all(`SELECT * FROM categorias ORDER BY nome ASC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.post('/api/categorias', autenticarToken, (req, res) => {
+  const { nome, imagem } = req.body;
+  db.run(`INSERT INTO categorias (nome, imagem) VALUES (?, ?)`, [nome, imagem || ''], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ id: this.lastID, message: 'Categoria cadastrada!' });
+  });
+});
+
+app.put('/api/categorias/:id', autenticarToken, (req, res) => {
+  const { nome, imagem } = req.body;
+  db.run(`UPDATE categorias SET nome = ?, imagem = ? WHERE id = ?`, [nome, imagem || '', req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'Categoria atualizada!' });
+  });
+});
+
+app.delete('/api/categorias/:id', autenticarToken, (req, res) => {
+  db.run(`DELETE FROM categorias WHERE id = ?`, [req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'Categoria removida!' });
+  });
+});
+
+// PRODUTOS
+app.get('/api/produtos', (req, res) => {
+  db.all(`SELECT * FROM produtos ORDER BY id DESC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.post('/api/produtos', autenticarToken, (req, res) => {
+  const { nome, preco, categoria, descricao, imagem, imagens } = req.body;
+  const imagensJson = Array.isArray(imagens) ? JSON.stringify(imagens) : JSON.stringify([imagem || '']);
+  const imagemPrincipal = imagem || (Array.isArray(imagens) && imagens[0]) || '';
+
+  db.run(
+    `INSERT INTO produtos (nome, preco, categoria, descricao, imagem, imagens) VALUES (?, ?, ?, ?, ?, ?)`,
+    [nome, preco, categoria, descricao, imagemPrincipal, imagensJson],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ id: this.lastID, message: 'Produto cadastrado!' });
+    }
+  );
+});
+
+app.put('/api/produtos/:id', autenticarToken, (req, res) => {
+  const { nome, preco, categoria, descricao, imagem, imagens } = req.body;
+  const imagensJson = Array.isArray(imagens) ? JSON.stringify(imagens) : JSON.stringify([imagem || '']);
+  const imagemPrincipal = imagem || (Array.isArray(imagens) && imagens[0]) || '';
+
+  db.run(
+    `UPDATE produtos SET nome = ?, preco = ?, categoria = ?, descricao = ?, imagem = ?, imagens = ? WHERE id = ?`,
+    [nome, preco, categoria, descricao, imagemPrincipal, imagensJson, req.params.id],
+    (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Produto atualizado!' });
+    }
+  );
+});
+
+app.delete('/api/produtos/:id', autenticarToken, (req, res) => {
+  db.run(`DELETE FROM produtos WHERE id = ?`, [req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'Produto removido!' });
+  });
+});
+
+// CARGOS E GESTÃO DE USUÁRIOS
+app.get('/api/cargos', autenticarToken, (req, res) => {
+  db.all(`SELECT * FROM cargos ORDER BY nome ASC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.post('/api/cargos', autenticarToken, (req, res) => {
+  const { nome, permissoes } = req.body;
+  const permissoesStr = JSON.stringify(permissoes || []);
+  db.run(`INSERT INTO cargos (nome, permissoes) VALUES (?, ?)`, [nome, permissoesStr], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ id: this.lastID, message: 'Cargo criado com sucesso!' });
+  });
+});
+
+app.get('/api/usuarios', autenticarToken, (req, res) => {
+  db.all(`SELECT u.id, u.usuario, u.is_master, u.cargo_id, c.nome as cargo_nome FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.post('/api/usuarios', autenticarToken, (req, res) => {
+  const { usuario, senha, cargo_id } = req.body;
+  db.run(`INSERT INTO usuarios (usuario, senha, is_master, cargo_id) VALUES (?, ?, 0, ?)`, [usuario, senha, cargo_id || null], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ id: this.lastID, message: 'Usuário admin criado!' });
+  });
+});
+
+app.delete('/api/usuarios/:id', autenticarToken, (req, res) => {
+  db.run(`DELETE FROM usuarios WHERE id = ? AND is_master = 0`, [req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'Usuário removido!' });
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));

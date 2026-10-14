@@ -2,7 +2,6 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const path = require('path');
 
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || 'printae_secret_key_2026';
@@ -17,10 +16,8 @@ const db = new sqlite3.Database('./database.db', (err) => {
 
 // CRIAÇÃO E MIGRAÇÃO DAS TABELAS
 db.serialize(() => {
-  // Configurações gerais (banner hero, sobre nos, logo)
   db.run(`CREATE TABLE IF NOT EXISTS configuracoes (chave TEXT PRIMARY KEY, valor TEXT)`);
 
-  // Banners Adicionais Rotativos
   db.run(`CREATE TABLE IF NOT EXISTS banners (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     imagem TEXT NOT NULL,
@@ -28,14 +25,12 @@ db.serialize(() => {
     ordem INTEGER DEFAULT 0
   )`);
 
-  // Categorias
   db.run(`CREATE TABLE IF NOT EXISTS categorias (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nome TEXT UNIQUE NOT NULL,
     imagem TEXT
   )`);
 
-  // Produtos
   db.run(`CREATE TABLE IF NOT EXISTS produtos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nome TEXT NOT NULL,
@@ -46,14 +41,12 @@ db.serialize(() => {
     imagens TEXT
   )`);
 
-  // Cargos e Permissões
   db.run(`CREATE TABLE IF NOT EXISTS cargos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nome TEXT UNIQUE NOT NULL,
     permissoes TEXT NOT NULL
   )`);
 
-  // Usuários Administradores
   db.run(`CREATE TABLE IF NOT EXISTS usuarios (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     usuario TEXT UNIQUE NOT NULL,
@@ -63,7 +56,7 @@ db.serialize(() => {
     FOREIGN KEY(cargo_id) REFERENCES cargos(id)
   )`);
 
-  // Cria Admin Master Inicial Padrão se não existir
+  // Criar Admin Master padrão se não existir
   db.get(`SELECT * FROM usuarios WHERE is_master = 1`, (err, master) => {
     if (!master) {
       db.run(`INSERT INTO usuarios (usuario, senha, is_master) VALUES ('admin', 'admin123', 1)`);
@@ -71,11 +64,11 @@ db.serialize(() => {
   });
 });
 
-// MIDDLEWARE DE AUTENTICAÇÃO JWT
+// MIDDLEWARE DE AUTENTICAÇÃO
 function autenticarToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(01).json({ error: 'Acesso negado. Token não fornecido.' });
+  if (!token) return res.status(401).json({ error: 'Acesso negado. Token não fornecido.' });
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
@@ -84,7 +77,7 @@ function autenticarToken(req, res, next) {
   });
 }
 
-// ROTAS DE AUTENTICAÇÃO E CONFIGS
+// LOGIN
 app.post('/api/login', (req, res) => {
   const { usuario, senha } = req.body;
   db.get(
@@ -101,7 +94,7 @@ app.post('/api/login', (req, res) => {
   );
 });
 
-// CONFIGURAÇÕES GERAIS (Hero Banner, Sobre Nós, Logo)
+// CONFIGURAÇÕES GERAIS
 app.get('/api/configuracoes', (req, res) => {
   db.all(`SELECT * FROM configuracoes`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -127,7 +120,7 @@ app.post('/api/configuracoes', autenticarToken, (req, res) => {
   );
 });
 
-// BANNERS ADICIONAIS ROTATIVOS
+// BANNERS ROTATIVOS
 app.get('/api/banners', (req, res) => {
   db.all(`SELECT * FROM banners ORDER BY ordem ASC, id DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -146,11 +139,11 @@ app.post('/api/banners', autenticarToken, (req, res) => {
 app.delete('/api/banners/:id', autenticarToken, (req, res) => {
   db.run(`DELETE FROM banners WHERE id = ?`, [req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: 'Banner removido com sucesso!' });
+    res.json({ message: 'Banner removido!' });
   });
 });
 
-// CATEGORIAS (CRUD Completo)
+// CATEGORIAS
 app.get('/api/categorias', (req, res) => {
   db.all(`SELECT * FROM categorias ORDER BY nome ASC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -226,11 +219,15 @@ app.delete('/api/produtos/:id', autenticarToken, (req, res) => {
   });
 });
 
-// CARGOS E GESTÃO DE USUÁRIOS
+// CARGOS (CRIAR E EDITAR)
 app.get('/api/cargos', autenticarToken, (req, res) => {
   db.all(`SELECT * FROM cargos ORDER BY nome ASC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+    const lista = rows.map(r => ({
+      ...r,
+      permissoes: typeof r.permissoes === 'string' ? JSON.parse(r.permissoes) : r.permissoes
+    }));
+    res.json(lista);
   });
 });
 
@@ -239,10 +236,20 @@ app.post('/api/cargos', autenticarToken, (req, res) => {
   const permissoesStr = JSON.stringify(permissoes || []);
   db.run(`INSERT INTO cargos (nome, permissoes) VALUES (?, ?)`, [nome, permissoesStr], function(err) {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ id: this.lastID, message: 'Cargo criado com sucesso!' });
+    res.json({ id: this.lastID, message: 'Cargo criado!' });
   });
 });
 
+app.put('/api/cargos/:id', autenticarToken, (req, res) => {
+  const { nome, permissoes } = req.body;
+  const permissoesStr = JSON.stringify(permissoes || []);
+  db.run(`UPDATE cargos SET nome = ?, permissoes = ? WHERE id = ?`, [nome, permissoesStr, req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'Cargo atualizado com sucesso!' });
+  });
+});
+
+// USUÁRIOS ADMINS (CRIAR, EDITAR E EXCLUIR)
 app.get('/api/usuarios', autenticarToken, (req, res) => {
   db.all(`SELECT u.id, u.usuario, u.is_master, u.cargo_id, c.nome as cargo_nome FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -256,6 +263,33 @@ app.post('/api/usuarios', autenticarToken, (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ id: this.lastID, message: 'Usuário admin criado!' });
   });
+});
+
+app.put('/api/usuarios/:id', autenticarToken, (req, res) => {
+  const { usuario, senha, cargo_id } = req.body;
+  const id = req.params.id;
+
+  if (senha && senha.trim() !== '') {
+    // Se digitou uma nova senha, atualiza o nome, senha e o cargo
+    db.run(
+      `UPDATE usuarios SET usuario = ?, senha = ?, cargo_id = ? WHERE id = ? AND is_master = 0`,
+      [usuario, senha, cargo_id || null, id],
+      (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'Usuário e senha atualizados com sucesso!' });
+      }
+    );
+  } else {
+    // Se deixou a senha em branco, atualiza apenas usuário e cargo mantendo a mesma senha
+    db.run(
+      `UPDATE usuarios SET usuario = ?, cargo_id = ? WHERE id = ? AND is_master = 0`,
+      [usuario, cargo_id || null, id],
+      (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'Usuário e cargo atualizados com sucesso!' });
+      }
+    );
+  }
 });
 
 app.delete('/api/usuarios/:id', autenticarToken, (req, res) => {

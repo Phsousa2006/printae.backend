@@ -14,7 +14,19 @@ const db = new sqlite3.Database('./database.db', (err) => {
   else console.log("Banco SQLite conectado com sucesso.");
 });
 
+// ==========================================
+// HELPERS
+// ==========================================
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => db.get(sql, params, (e, r) => (e ? reject(e) : resolve(r))));
+}
+function parseLista(str) {
+  try { const v = JSON.parse(str); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+
+// ==========================================
 // CRIAÇÃO E MIGRAÇÃO DAS TABELAS
+// ==========================================
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS configuracoes (chave TEXT PRIMARY KEY, valor TEXT)`);
 
@@ -47,7 +59,6 @@ db.serialize(() => {
     permissoes TEXT NOT NULL
   )`);
 
-  // Adicionada a coluna permissoes_individuais na tabela usuarios
   db.run(`CREATE TABLE IF NOT EXISTS usuarios (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     usuario TEXT UNIQUE NOT NULL,
@@ -58,7 +69,6 @@ db.serialize(() => {
     FOREIGN KEY(cargo_id) REFERENCES cargos(id)
   )`);
 
-  // NOVAS TABELAS PARA CLIENTES E PEDIDOS
   db.run(`CREATE TABLE IF NOT EXISTS clientes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT UNIQUE NOT NULL,
@@ -75,7 +85,9 @@ db.serialize(() => {
     data TEXT NOT NULL
   )`);
 
-  // Criar Admin Master padrão se não existir
+  // Coluna de status dos pedidos (erro de "coluna duplicada" é ignorado de propósito)
+  db.run(`ALTER TABLE pedidos ADD COLUMN status TEXT DEFAULT 'aberto'`, () => {});
+
   db.get(`SELECT * FROM usuarios WHERE is_master = 1`, (err, master) => {
     if (!master) {
       db.run(`INSERT INTO usuarios (usuario, senha, is_master) VALUES ('admin', 'admin123', 1)`);
@@ -83,37 +95,102 @@ db.serialize(() => {
   });
 });
 
-// MIDDLEWARE DE AUTENTICAÇÃO
-function autenticarToken(req, res, next) {
+// ==========================================
+// AUTENTICAÇÃO E PERMISSÕES
+// ==========================================
+
+// Token de ADMIN (os tokens de cliente não têm "usuario", então não passam aqui)
+function autenticarAdmin(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'Acesso negado. Token não fornecido.' });
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
+    if (!user || typeof user.usuario !== 'string' || user.email) {
+      return res.status(403).json({ error: 'Token não pertence a um administrador.' });
+    }
     req.user = user;
     next();
   });
 }
 
+// Lê SEMPRE do banco: alterar cargo/permissões vale na hora, sem esperar o token expirar
+async function carregarPermissoes(userId) {
+  const u = await dbGet(
+    `SELECT u.id, u.usuario, u.is_master, u.cargo_id, u.permissoes_individuais, c.permissoes AS cargo_permissoes
+     FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id WHERE u.id = ?`,
+    [userId]
+  );
+  if (!u) return null;
+  const isMaster = !!u.is_master;
+  const permissoes = isMaster
+    ? ['all']
+    : [...new Set([...parseLista(u.cargo_permissoes), ...parseLista(u.permissoes_individuais)])];
+  return { id: u.id, usuario: u.usuario, is_master: isMaster, cargo_id: u.cargo_id, permissoes };
+}
+
+// exigirPermissao('a','b') => precisa ter pelo menos UMA delas. Master sempre passa.
+// exigirPermissao() sem argumentos => só master.
+function exigirPermissao(...necessarias) {
+  return [autenticarAdmin, async (req, res, next) => {
+    try {
+      const atual = await carregarPermissoes(req.user.id);
+      if (!atual) return res.status(401).json({ error: 'Usuário não existe mais.' });
+      req.admin = atual;
+      if (atual.is_master || necessarias.some(p => atual.permissoes.includes(p))) return next();
+      return res.status(403).json({ error: 'Você não tem permissão para realizar esta ação.' });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  }];
+}
+
+// Impede que alguém (não master) conceda mais do que ele mesmo possui
+async function validarConcessao(admin, cargo_id, permissoesIndividuais) {
+  if (admin.is_master) return null;
+  const minhas = new Set(admin.permissoes);
+  const pedidas = Array.isArray(permissoesIndividuais) ? permissoesIndividuais : [];
+  if (pedidas.some(p => !minhas.has(p))) return 'Você não pode conceder permissões que você mesmo não possui.';
+  if (cargo_id) {
+    const cargo = await dbGet(`SELECT permissoes FROM cargos WHERE id = ?`, [cargo_id]);
+    if (cargo && parseLista(cargo.permissoes).some(p => !minhas.has(p))) {
+      return 'Você não pode atribuir um cargo com permissões que você mesmo não possui.';
+    }
+  }
+  return null;
+}
+
+// ==========================================
 // LOGIN ADMIN
+// ==========================================
 app.post('/api/login', (req, res) => {
   const { usuario, senha } = req.body;
-  db.get(
-    `SELECT u.*, c.permissoes as cargo_permissoes FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id WHERE u.usuario = ? AND u.senha = ?`,
-    [usuario, senha],
-    (err, user) => {
-      if (err || !user) return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
-      
-      const cargoPerms = user.cargo_permissoes ? JSON.parse(user.cargo_permissoes) : [];
-      const indPerms = user.permissoes_individuais ? JSON.parse(user.permissoes_individuais) : [];
-      const todasPermissoes = user.is_master ? ['all'] : [...new Set([...cargoPerms, ...indPerms])];
-
-      const token = jwt.sign({ id: user.id, usuario: user.usuario, is_master: user.is_master, permissoes: todasPermissoes }, JWT_SECRET, { expiresIn: '12h' });
-      
-      res.json({ token, usuario: user.usuario, is_master: !!user.is_master, permissoes: todasPermissoes });
+  db.get(`SELECT id FROM usuarios WHERE usuario = ? AND senha = ?`, [usuario, senha], async (err, row) => {
+    if (err || !row) return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
+    try {
+      const atual = await carregarPermissoes(row.id);
+      const token = jwt.sign(
+        { id: atual.id, usuario: atual.usuario, is_master: atual.is_master ? 1 : 0 },
+        JWT_SECRET,
+        { expiresIn: '12h' }
+      );
+      res.json({ token, usuario: atual.usuario, is_master: atual.is_master, permissoes: atual.permissoes });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
     }
-  );
+  });
+});
+
+// Quem sou eu + permissões efetivas ATUAIS (o painel usa isto para montar o menu)
+app.get('/api/me', autenticarAdmin, async (req, res) => {
+  try {
+    const atual = await carregarPermissoes(req.user.id);
+    if (!atual) return res.status(401).json({ error: 'Usuário não existe mais.' });
+    res.json(atual);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ==========================================
@@ -127,7 +204,7 @@ app.post('/api/clientes/auth', (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
 
     if (!cliente) {
-      db.run(`INSERT INTO clientes (email, senha) VALUES (?, ?)`, [email, senha], function(err) {
+      db.run(`INSERT INTO clientes (email, senha) VALUES (?, ?)`, [email, senha], function (err) {
         if (err) return res.status(500).json({ error: err.message });
         const token = jwt.sign({ id: this.lastID, email }, JWT_SECRET, { expiresIn: '30d' });
         res.json({ token, email, message: 'Conta criada e login efetuado com sucesso!' });
@@ -143,7 +220,7 @@ app.post('/api/clientes/auth', (req, res) => {
 });
 
 // ==========================================
-// ROTAS DE PEDIDOS DO CLIENTE
+// PEDIDOS DO CLIENTE
 // ==========================================
 app.post('/api/pedidos', (req, res) => {
   const { cliente_email, itens, subtotal, frete, total, data } = req.body;
@@ -151,9 +228,9 @@ app.post('/api/pedidos', (req, res) => {
 
   const itensStr = JSON.stringify(itens);
   db.run(
-    `INSERT INTO pedidos (cliente_email, itens, subtotal, frete, total, data) VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO pedidos (cliente_email, itens, subtotal, frete, total, data, status) VALUES (?, ?, ?, ?, ?, ?, 'aberto')`,
     [cliente_email, itensStr, subtotal, frete, total, data || new Date().toLocaleDateString('pt-BR')],
-    function(err) {
+    function (err) {
       if (err) return res.status(500).json({ error: err.message });
       res.json({ id: this.lastID, message: 'Pedido registrado com sucesso!' });
     }
@@ -161,44 +238,82 @@ app.post('/api/pedidos', (req, res) => {
 });
 
 app.get('/api/pedidos/:email', (req, res) => {
-  const email = req.params.email;
-  db.all(`SELECT * FROM pedidos WHERE cliente_email = ? ORDER BY id DESC`, [email], (err, rows) => {
+  db.all(`SELECT * FROM pedidos WHERE cliente_email = ? ORDER BY id DESC`, [req.params.email], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    const formatados = rows.map(p => ({
-      ...p,
-      itens: JSON.parse(p.itens)
-    }));
-    res.json(formatados);
+    res.json(rows.map(p => ({ ...p, itens: parseLista(p.itens) })));
   });
 });
 
+// ==========================================
+// PEDIDOS (ADMIN)
+// ==========================================
+app.get('/api/admin/pedidos', ...exigirPermissao('ver_pedidos', 'finalizar_pedidos', 'cancelar_pedidos'), (req, res) => {
+  db.all(`SELECT * FROM pedidos ORDER BY id DESC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows.map(p => ({ ...p, status: p.status || 'aberto', itens: parseLista(p.itens) })));
+  });
+});
+
+app.put('/api/admin/pedidos/:id/status', autenticarAdmin, async (req, res) => {
+  const { status } = req.body;
+  const exigida = status === 'finalizado' ? 'finalizar_pedidos' : status === 'cancelado' ? 'cancelar_pedidos' : null;
+  if (!exigida) return res.status(400).json({ error: 'Status inválido.' });
+  try {
+    const atual = await carregarPermissoes(req.user.id);
+    if (!atual || !(atual.is_master || atual.permissoes.includes(exigida))) {
+      return res.status(403).json({ error: 'Você não tem permissão para realizar esta ação.' });
+    }
+    db.run(`UPDATE pedidos SET status = ? WHERE id = ?`, [status, req.params.id], (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Status atualizado!' });
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==========================================
 // CONFIGURAÇÕES GERAIS
+// ==========================================
 app.get('/api/configuracoes', (req, res) => {
   db.all(`SELECT * FROM configuracoes`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     const configObj = {};
     rows.forEach(r => {
       try { configObj[r.chave] = JSON.parse(r.valor); }
-      catch(e) { configObj[r.chave] = r.valor; }
+      catch (e) { configObj[r.chave] = r.valor; }
     });
     res.json(configObj);
   });
 });
 
-app.post('/api/configuracoes', autenticarToken, (req, res) => {
+// logo_url exige "alterar_logo"; as demais chaves (textos, imagens, contatos) exigem "alterar_textos"
+app.post('/api/configuracoes', autenticarAdmin, async (req, res) => {
   const { chave, valor } = req.body;
-  const valorStr = typeof valor === 'object' ? JSON.stringify(valor) : valor;
-  db.run(
-    `INSERT INTO configuracoes (chave, valor) VALUES (?, ?) ON CONFLICT(chave) DO UPDATE SET valor = ?`,
-    [chave, valorStr, valorStr],
-    (err) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ message: 'Configuração salva com sucesso!' });
+  if (!chave) return res.status(400).json({ error: 'Chave obrigatória.' });
+  const exigida = chave === 'logo_url' ? 'alterar_logo' : 'alterar_textos';
+  try {
+    const atual = await carregarPermissoes(req.user.id);
+    if (!atual || !(atual.is_master || atual.permissoes.includes(exigida))) {
+      return res.status(403).json({ error: 'Você não tem permissão para realizar esta ação.' });
     }
-  );
+    const valorStr = typeof valor === 'object' ? JSON.stringify(valor) : valor;
+    db.run(
+      `INSERT INTO configuracoes (chave, valor) VALUES (?, ?) ON CONFLICT(chave) DO UPDATE SET valor = ?`,
+      [chave, valorStr, valorStr],
+      (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'Configuração salva com sucesso!' });
+      }
+    );
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// BANNERS ROTATIVOS
+// ==========================================
+// BANNERS
+// ==========================================
 app.get('/api/banners', (req, res) => {
   db.all(`SELECT * FROM banners ORDER BY ordem ASC, id DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -206,22 +321,24 @@ app.get('/api/banners', (req, res) => {
   });
 });
 
-app.post('/api/banners', autenticarToken, (req, res) => {
+app.post('/api/banners', ...exigirPermissao('adicionar_banners'), (req, res) => {
   const { imagem, link, ordem } = req.body;
-  db.run(`INSERT INTO banners (imagem, link, ordem) VALUES (?, ?, ?)`, [imagem, link || '', ordem || 0], function(err) {
+  db.run(`INSERT INTO banners (imagem, link, ordem) VALUES (?, ?, ?)`, [imagem, link || '', ordem || 0], function (err) {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ id: this.lastID, message: 'Banner adicionado!' });
   });
 });
 
-app.delete('/api/banners/:id', autenticarToken, (req, res) => {
+app.delete('/api/banners/:id', ...exigirPermissao('remover_banners'), (req, res) => {
   db.run(`DELETE FROM banners WHERE id = ?`, [req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'Banner removido!' });
   });
 });
 
+// ==========================================
 // CATEGORIAS
+// ==========================================
 app.get('/api/categorias', (req, res) => {
   db.all(`SELECT * FROM categorias ORDER BY nome ASC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -229,15 +346,15 @@ app.get('/api/categorias', (req, res) => {
   });
 });
 
-app.post('/api/categorias', autenticarToken, (req, res) => {
+app.post('/api/categorias', ...exigirPermissao('adicionar_categorias'), (req, res) => {
   const { nome, imagem } = req.body;
-  db.run(`INSERT INTO categorias (nome, imagem) VALUES (?, ?)`, [nome, imagem || ''], function(err) {
+  db.run(`INSERT INTO categorias (nome, imagem) VALUES (?, ?)`, [nome, imagem || ''], function (err) {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ id: this.lastID, message: 'Categoria cadastrada!' });
   });
 });
 
-app.put('/api/categorias/:id', autenticarToken, (req, res) => {
+app.put('/api/categorias/:id', ...exigirPermissao('editar_categorias'), (req, res) => {
   const { nome, imagem } = req.body;
   db.run(`UPDATE categorias SET nome = ?, imagem = ? WHERE id = ?`, [nome, imagem || '', req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -245,14 +362,16 @@ app.put('/api/categorias/:id', autenticarToken, (req, res) => {
   });
 });
 
-app.delete('/api/categorias/:id', autenticarToken, (req, res) => {
+app.delete('/api/categorias/:id', ...exigirPermissao('remover_categorias'), (req, res) => {
   db.run(`DELETE FROM categorias WHERE id = ?`, [req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'Categoria removida!' });
   });
 });
 
+// ==========================================
 // PRODUTOS
+// ==========================================
 app.get('/api/produtos', (req, res) => {
   db.all(`SELECT * FROM produtos ORDER BY id DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -260,7 +379,7 @@ app.get('/api/produtos', (req, res) => {
   });
 });
 
-app.post('/api/produtos', autenticarToken, (req, res) => {
+app.post('/api/produtos', ...exigirPermissao('adicionar_produtos'), (req, res) => {
   const { nome, preco, categoria, descricao, imagem, imagens } = req.body;
   const imagensJson = Array.isArray(imagens) ? JSON.stringify(imagens) : JSON.stringify([imagem || '']);
   const imagemPrincipal = imagem || (Array.isArray(imagens) && imagens[0]) || '';
@@ -275,7 +394,7 @@ app.post('/api/produtos', autenticarToken, (req, res) => {
   );
 });
 
-app.put('/api/produtos/:id', autenticarToken, (req, res) => {
+app.put('/api/produtos/:id', ...exigirPermissao('editar_produtos'), (req, res) => {
   const { nome, preco, categoria, descricao, imagem, imagens } = req.body;
   const imagensJson = Array.isArray(imagens) ? JSON.stringify(imagens) : JSON.stringify([imagem || '']);
   const imagemPrincipal = imagem || (Array.isArray(imagens) && imagens[0]) || '';
@@ -290,96 +409,122 @@ app.put('/api/produtos/:id', autenticarToken, (req, res) => {
   );
 });
 
-app.delete('/api/produtos/:id', autenticarToken, (req, res) => {
+app.delete('/api/produtos/:id', ...exigirPermissao('remover_produtos'), (req, res) => {
   db.run(`DELETE FROM produtos WHERE id = ?`, [req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'Produto removido!' });
   });
 });
 
-// CARGOS
-app.get('/api/cargos', autenticarToken, (req, res) => {
+// ==========================================
+// CARGOS (somente master cria/edita; quem gerencia usuários pode LISTAR para escolher)
+// ==========================================
+app.get('/api/cargos', ...exigirPermissao('adicionar_admin', 'editar_admin'), (req, res) => {
   db.all(`SELECT * FROM cargos ORDER BY nome ASC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    const lista = rows.map(r => ({
-      ...r,
-      permissoes: typeof r.permissoes === 'string' ? JSON.parse(r.permissoes) : r.permissoes
-    }));
-    res.json(lista);
+    res.json(rows.map(r => ({ ...r, permissoes: parseLista(r.permissoes) })));
   });
 });
 
-app.post('/api/cargos', autenticarToken, (req, res) => {
+app.post('/api/cargos', ...exigirPermissao(), (req, res) => {
   const { nome, permissoes } = req.body;
-  const permissoesStr = JSON.stringify(permissoes || []);
-  db.run(`INSERT INTO cargos (nome, permissoes) VALUES (?, ?)`, [nome, permissoesStr], function(err) {
+  db.run(`INSERT INTO cargos (nome, permissoes) VALUES (?, ?)`, [nome, JSON.stringify(permissoes || [])], function (err) {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ id: this.lastID, message: 'Cargo criado!' });
   });
 });
 
-app.put('/api/cargos/:id', autenticarToken, (req, res) => {
+app.put('/api/cargos/:id', ...exigirPermissao(), (req, res) => {
   const { nome, permissoes } = req.body;
-  const permissoesStr = JSON.stringify(permissoes || []);
-  db.run(`UPDATE cargos SET nome = ?, permissoes = ? WHERE id = ?`, [nome, permissoesStr, req.params.id], (err) => {
+  db.run(`UPDATE cargos SET nome = ?, permissoes = ? WHERE id = ?`, [nome, JSON.stringify(permissoes || []), req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'Cargo atualizado com sucesso!' });
   });
 });
 
-// USUÁRIOS ADMINS
-app.get('/api/usuarios', autenticarToken, (req, res) => {
-  db.all(`SELECT u.id, u.usuario, u.is_master, u.cargo_id, u.permissoes_individuais, c.nome as cargo_nome FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const formatados = rows.map(u => ({
-      ...u,
-      permissoes_individuais: u.permissoes_individuais ? JSON.parse(u.permissoes_individuais) : []
-    }));
-    res.json(formatados);
-  });
-});
-
-app.post('/api/usuarios', autenticarToken, (req, res) => {
-  const { usuario, senha, cargo_id, permissoes_individuais } = req.body;
-  const permsStr = JSON.stringify(permissoes_individuais || []);
-  
-  db.run(
-    `INSERT INTO usuarios (usuario, senha, is_master, cargo_id, permissoes_individuais) VALUES (?, ?, 0, ?, ?)`, 
-    [usuario, senha, cargo_id || null, permsStr], 
-    function(err) {
+// ==========================================
+// USUÁRIOS ADMIN
+// ==========================================
+app.get('/api/usuarios', ...exigirPermissao('adicionar_admin', 'editar_admin', 'remover_admin', 'alterar_senha_admin'), (req, res) => {
+  db.all(
+    `SELECT u.id, u.usuario, u.is_master, u.cargo_id, u.permissoes_individuais, c.nome as cargo_nome
+     FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id`,
+    [],
+    (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
-      res.json({ id: this.lastID, message: 'Usuário admin criado!' });
+      res.json(rows.map(u => ({ ...u, permissoes_individuais: parseLista(u.permissoes_individuais) })));
     }
   );
 });
 
-app.put('/api/usuarios/:id', autenticarToken, (req, res) => {
+app.post('/api/usuarios', ...exigirPermissao('adicionar_admin'), async (req, res) => {
   const { usuario, senha, cargo_id, permissoes_individuais } = req.body;
-  const id = req.params.id;
-  const permsStr = JSON.stringify(permissoes_individuais || []);
+  if (!usuario || !senha) return res.status(400).json({ error: 'Usuário e senha são obrigatórios.' });
+  try {
+    const negado = await validarConcessao(req.admin, cargo_id, permissoes_individuais);
+    if (negado) return res.status(403).json({ error: negado });
 
-  if (senha && senha.trim() !== '') {
     db.run(
-      `UPDATE usuarios SET usuario = ?, senha = ?, cargo_id = ?, permissoes_individuais = ? WHERE id = ? AND is_master = 0`,
-      [usuario, senha, cargo_id || null, permsStr, id],
-      (err) => {
+      `INSERT INTO usuarios (usuario, senha, is_master, cargo_id, permissoes_individuais) VALUES (?, ?, 0, ?, ?)`,
+      [usuario, senha, cargo_id || null, JSON.stringify(permissoes_individuais || [])],
+      function (err) {
         if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Usuário e senha atualizados com sucesso!' });
+        res.json({ id: this.lastID, message: 'Usuário admin criado!' });
       }
     );
-  } else {
-    db.run(
-      `UPDATE usuarios SET usuario = ?, cargo_id = ?, permissoes_individuais = ? WHERE id = ? AND is_master = 0`,
-      [usuario, cargo_id || null, permsStr, id],
-      (err) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Usuário e cargo atualizados com sucesso!' });
-      }
-    );
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-app.delete('/api/usuarios/:id', autenticarToken, (req, res) => {
+// PUT só com { senha } = troca de senha ("alterar_senha_admin").
+// PUT com usuario/cargo/permissões = edição ("editar_admin"); senha junto exige as duas.
+app.put('/api/usuarios/:id', autenticarAdmin, async (req, res) => {
+  const { usuario, senha, cargo_id, permissoes_individuais } = req.body;
+  const id = req.params.id;
+  const temSenha = typeof senha === 'string' && senha.trim() !== '';
+  const editaDados = usuario !== undefined || cargo_id !== undefined || permissoes_individuais !== undefined;
+
+  try {
+    const atual = await carregarPermissoes(req.user.id);
+    if (!atual) return res.status(401).json({ error: 'Usuário não existe mais.' });
+    const pode = (p) => atual.is_master || atual.permissoes.includes(p);
+
+    if (temSenha && !pode('alterar_senha_admin')) {
+      return res.status(403).json({ error: 'Você não tem permissão para alterar senhas.' });
+    }
+    if (editaDados && !pode('editar_admin')) {
+      return res.status(403).json({ error: 'Você não tem permissão para editar usuários.' });
+    }
+    if (!temSenha && !editaDados) return res.status(400).json({ error: 'Nada para atualizar.' });
+
+    if (editaDados) {
+      const negado = await validarConcessao(atual, cargo_id, permissoes_individuais);
+      if (negado) return res.status(403).json({ error: negado });
+    }
+
+    const sets = [];
+    const params = [];
+    if (editaDados) {
+      sets.push('usuario = ?', 'cargo_id = ?', 'permissoes_individuais = ?');
+      params.push(usuario, cargo_id || null, JSON.stringify(permissoes_individuais || []));
+    }
+    if (temSenha) { sets.push('senha = ?'); params.push(senha); }
+    params.push(id);
+
+    db.run(`UPDATE usuarios SET ${sets.join(', ')} WHERE id = ? AND is_master = 0`, params, (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Usuário atualizado com sucesso!' });
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/usuarios/:id', ...exigirPermissao('remover_admin'), (req, res) => {
+  if (String(req.params.id) === String(req.admin.id)) {
+    return res.status(400).json({ error: 'Você não pode excluir a si mesmo.' });
+  }
   db.run(`DELETE FROM usuarios WHERE id = ? AND is_master = 0`, [req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ message: 'Usuário removido!' });

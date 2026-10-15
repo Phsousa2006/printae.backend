@@ -56,6 +56,23 @@ db.serialize(() => {
     FOREIGN KEY(cargo_id) REFERENCES cargos(id)
   )`);
 
+  // NOVAS TABELAS PARA CLIENTES E PEDIDOS
+  db.run(`CREATE TABLE IF NOT EXISTS clientes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    senha TEXT NOT NULL
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS pedidos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cliente_email TEXT NOT NULL,
+    itens TEXT NOT NULL,
+    subtotal REAL NOT NULL,
+    frete REAL NOT NULL,
+    total REAL NOT NULL,
+    data TEXT NOT NULL
+  )`);
+
   // Criar Admin Master padrão se não existir
   db.get(`SELECT * FROM usuarios WHERE is_master = 1`, (err, master) => {
     if (!master) {
@@ -77,7 +94,7 @@ function autenticarToken(req, res, next) {
   });
 }
 
-// LOGIN
+// LOGIN ADMIN
 app.post('/api/login', (req, res) => {
   const { usuario, senha } = req.body;
   db.get(
@@ -92,6 +109,63 @@ app.post('/api/login', (req, res) => {
       res.json({ token, usuario: user.usuario, is_master: !!user.is_master, permissoes: permissoesArray });
     }
   );
+});
+
+// ==========================================
+// ROTAS DE CLIENTES (CADASTRO / LOGIN)
+// ==========================================
+app.post('/api/clientes/auth', (req, res) => {
+  const { email, senha } = req.body;
+  if (!email || !senha) return res.status(400).json({ error: 'E-mail e senha obrigatórios.' });
+
+  db.get(`SELECT * FROM clientes WHERE email = ?`, [email], (err, cliente) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    if (!cliente) {
+      // Cadastra automaticamente se não existir
+      db.run(`INSERT INTO clientes (email, senha) VALUES (?, ?)`, [email, senha], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        const token = jwt.sign({ id: this.lastID, email }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ token, email, message: 'Conta criada e login efetuado com sucesso!' });
+      });
+    } else {
+      if (cliente.senha !== senha) {
+        return res.status(401).json({ error: 'Senha incorreta.' });
+      }
+      const token = jwt.sign({ id: cliente.id, email: cliente.email }, JWT_SECRET, { expiresIn: '30d' });
+      res.json({ token, email: cliente.email, message: 'Login efetuado com sucesso!' });
+    }
+  });
+});
+
+// ==========================================
+// ROTAS DE PEDIDOS DO CLIENTE
+// ==========================================
+app.post('/api/pedidos', (req, res) => {
+  const { cliente_email, itens, subtotal, frete, total, data } = req.body;
+  if (!cliente_email || !itens) return res.status(400).json({ error: 'Dados do pedido incompletos.' });
+
+  const itensStr = JSON.stringify(itens);
+  db.run(
+    `INSERT INTO pedidos (cliente_email, itens, subtotal, frete, total, data) VALUES (?, ?, ?, ?, ?, ?)`,
+    [cliente_email, itensStr, subtotal, frete, total, data || new Date().toLocaleDateString('pt-BR')],
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ id: this.lastID, message: 'Pedido registrado com sucesso!' });
+    }
+  );
+});
+
+app.get('/api/pedidos/:email', (req, res) => {
+  const email = req.params.email;
+  db.all(`SELECT * FROM pedidos WHERE cliente_email = ? ORDER BY id DESC`, [email], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    const formatados = rows.map(p => ({
+      ...p,
+      itens: JSON.parse(p.itens)
+    }));
+    res.json(formatados);
+  });
 });
 
 // CONFIGURAÇÕES GERAIS
@@ -219,7 +293,7 @@ app.delete('/api/produtos/:id', autenticarToken, (req, res) => {
   });
 });
 
-// CARGOS (CRIAR E EDITAR)
+// CARGOS
 app.get('/api/cargos', autenticarToken, (req, res) => {
   db.all(`SELECT * FROM cargos ORDER BY nome ASC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -249,7 +323,7 @@ app.put('/api/cargos/:id', autenticarToken, (req, res) => {
   });
 });
 
-// USUÁRIOS ADMINS (CRIAR, EDITAR E EXCLUIR)
+// USUÁRIOS ADMINS
 app.get('/api/usuarios', autenticarToken, (req, res) => {
   db.all(`SELECT u.id, u.usuario, u.is_master, u.cargo_id, c.nome as cargo_nome FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -270,7 +344,6 @@ app.put('/api/usuarios/:id', autenticarToken, (req, res) => {
   const id = req.params.id;
 
   if (senha && senha.trim() !== '') {
-    // Se digitou uma nova senha, atualiza o nome, senha e o cargo
     db.run(
       `UPDATE usuarios SET usuario = ?, senha = ?, cargo_id = ? WHERE id = ? AND is_master = 0`,
       [usuario, senha, cargo_id || null, id],
@@ -280,7 +353,6 @@ app.put('/api/usuarios/:id', autenticarToken, (req, res) => {
       }
     );
   } else {
-    // Se deixou a senha em branco, atualiza apenas usuário e cargo mantendo a mesma senha
     db.run(
       `UPDATE usuarios SET usuario = ?, cargo_id = ? WHERE id = ? AND is_master = 0`,
       [usuario, cargo_id || null, id],

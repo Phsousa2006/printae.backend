@@ -47,12 +47,14 @@ db.serialize(() => {
     permissoes TEXT NOT NULL
   )`);
 
+  // Adicionada a coluna permissoes_individuais na tabela usuarios
   db.run(`CREATE TABLE IF NOT EXISTS usuarios (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     usuario TEXT UNIQUE NOT NULL,
     senha TEXT NOT NULL,
     is_master INTEGER DEFAULT 0,
     cargo_id INTEGER,
+    permissoes_individuais TEXT,
     FOREIGN KEY(cargo_id) REFERENCES cargos(id)
   )`);
 
@@ -98,15 +100,18 @@ function autenticarToken(req, res, next) {
 app.post('/api/login', (req, res) => {
   const { usuario, senha } = req.body;
   db.get(
-    `SELECT u.*, c.permissoes FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id WHERE u.usuario = ? AND u.senha = ?`,
+    `SELECT u.*, c.permissoes as cargo_permissoes FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id WHERE u.usuario = ? AND u.senha = ?`,
     [usuario, senha],
     (err, user) => {
       if (err || !user) return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
       
-      const permissoesArray = user.is_master ? ['all'] : (user.permissoes ? JSON.parse(user.permissoes) : []);
-      const token = jwt.sign({ id: user.id, usuario: user.usuario, is_master: user.is_master, permissoes: permissoesArray }, JWT_SECRET, { expiresIn: '12h' });
+      const cargoPerms = user.cargo_permissoes ? JSON.parse(user.cargo_permissoes) : [];
+      const indPerms = user.permissoes_individuais ? JSON.parse(user.permissoes_individuais) : [];
+      const todasPermissoes = user.is_master ? ['all'] : [...new Set([...cargoPerms, ...indPerms])];
+
+      const token = jwt.sign({ id: user.id, usuario: user.usuario, is_master: user.is_master, permissoes: todasPermissoes }, JWT_SECRET, { expiresIn: '12h' });
       
-      res.json({ token, usuario: user.usuario, is_master: !!user.is_master, permissoes: permissoesArray });
+      res.json({ token, usuario: user.usuario, is_master: !!user.is_master, permissoes: todasPermissoes });
     }
   );
 });
@@ -122,7 +127,6 @@ app.post('/api/clientes/auth', (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
 
     if (!cliente) {
-      // Cadastra automaticamente se não existir
       db.run(`INSERT INTO clientes (email, senha) VALUES (?, ?)`, [email, senha], function(err) {
         if (err) return res.status(500).json({ error: err.message });
         const token = jwt.sign({ id: this.lastID, email }, JWT_SECRET, { expiresIn: '30d' });
@@ -325,28 +329,39 @@ app.put('/api/cargos/:id', autenticarToken, (req, res) => {
 
 // USUÁRIOS ADMINS
 app.get('/api/usuarios', autenticarToken, (req, res) => {
-  db.all(`SELECT u.id, u.usuario, u.is_master, u.cargo_id, c.nome as cargo_nome FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id`, [], (err, rows) => {
+  db.all(`SELECT u.id, u.usuario, u.is_master, u.cargo_id, u.permissoes_individuais, c.nome as cargo_nome FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+    const formatados = rows.map(u => ({
+      ...u,
+      permissoes_individuais: u.permissoes_individuais ? JSON.parse(u.permissoes_individuais) : []
+    }));
+    res.json(formatados);
   });
 });
 
 app.post('/api/usuarios', autenticarToken, (req, res) => {
-  const { usuario, senha, cargo_id } = req.body;
-  db.run(`INSERT INTO usuarios (usuario, senha, is_master, cargo_id) VALUES (?, ?, 0, ?)`, [usuario, senha, cargo_id || null], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ id: this.lastID, message: 'Usuário admin criado!' });
-  });
+  const { usuario, senha, cargo_id, permissoes_individuais } = req.body;
+  const permsStr = JSON.stringify(permissoes_individuais || []);
+  
+  db.run(
+    `INSERT INTO usuarios (usuario, senha, is_master, cargo_id, permissoes_individuais) VALUES (?, ?, 0, ?, ?)`, 
+    [usuario, senha, cargo_id || null, permsStr], 
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ id: this.lastID, message: 'Usuário admin criado!' });
+    }
+  );
 });
 
 app.put('/api/usuarios/:id', autenticarToken, (req, res) => {
-  const { usuario, senha, cargo_id } = req.body;
+  const { usuario, senha, cargo_id, permissoes_individuais } = req.body;
   const id = req.params.id;
+  const permsStr = JSON.stringify(permissoes_individuais || []);
 
   if (senha && senha.trim() !== '') {
     db.run(
-      `UPDATE usuarios SET usuario = ?, senha = ?, cargo_id = ? WHERE id = ? AND is_master = 0`,
-      [usuario, senha, cargo_id || null, id],
+      `UPDATE usuarios SET usuario = ?, senha = ?, cargo_id = ?, permissoes_individuais = ? WHERE id = ? AND is_master = 0`,
+      [usuario, senha, cargo_id || null, permsStr, id],
       (err) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ message: 'Usuário e senha atualizados com sucesso!' });
@@ -354,8 +369,8 @@ app.put('/api/usuarios/:id', autenticarToken, (req, res) => {
     );
   } else {
     db.run(
-      `UPDATE usuarios SET usuario = ?, cargo_id = ? WHERE id = ? AND is_master = 0`,
-      [usuario, cargo_id || null, id],
+      `UPDATE usuarios SET usuario = ?, cargo_id = ?, permissoes_individuais = ? WHERE id = ? AND is_master = 0`,
+      [usuario, cargo_id || null, permsStr, id],
       (err) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ message: 'Usuário e cargo atualizados com sucesso!' });

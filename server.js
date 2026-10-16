@@ -396,26 +396,28 @@ app.post('/api/esqueci-senha', (req, res) => {
   // processamento em segundo plano (também evita diferença de tempo entre e-mail existente e inexistente)
   (async () => {
     try {
-      if (!validarEmail(email)) return;
-      if (!limitar(`esqueci-ip:${req.ip}`, 5, 60 * 60 * 1000)) return;
-      if (!limitar(`esqueci-email:${email}`, 3, 60 * 60 * 1000)) return;
+      if (!validarEmail(email)) return console.log('esqueci-senha: e-mail com formato inválido.');
+      if (!limitar(`esqueci-ip:${req.ip}`, 5, 60 * 60 * 1000) || !limitar(`esqueci-email:${email}`, 3, 60 * 60 * 1000)) {
+        return console.log('esqueci-senha: limite de pedidos por hora atingido (aguarde 1h ou reinicie o serviço).');
+      }
       if (!ADMIN_URL) return console.error('ADMIN_URL não definida: não é possível montar o link de recuperação.');
 
       const u = await dbGet(`SELECT id, usuario FROM usuarios WHERE email = ? AND is_master = 1`, [email]); // recuperação por e-mail: somente master
-      if (!u) return;
+      if (!u) return console.log(`esqueci-senha: nenhum usuário MASTER cadastrado com o e-mail ${email}.`);
 
       const token = crypto.randomBytes(32).toString('hex');
       await dbRun(`DELETE FROM reset_senha WHERE usuario_id = ?`, [u.id]); // invalida links anteriores
       await dbRun(`INSERT INTO reset_senha (usuario_id, token_hash, expira_em) VALUES (?, ?, ?)`, [u.id, hashToken(token), Date.now() + 30 * 60 * 1000]);
 
       const link = `${ADMIN_URL}#reset=${token}`;
-      await enviarEmail(email, 'Redefinição de senha - Painel Printae.gyn', `
+      const enviado = await enviarEmail(email, 'Redefinição de senha - Painel Printae.gyn', `
         <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#222">
           <h2>Redefinir senha</h2>
           <p>Olá, <b>${esc(u.usuario)}</b>! Recebemos um pedido para redefinir a senha do painel administrativo.</p>
           <p><a href="${link}" style="display:inline-block;background:#6b2fd1;color:#fff;padding:12px 22px;border-radius:10px;text-decoration:none;font-weight:bold">Criar nova senha</a></p>
           <p style="font-size:13px;color:#555">Este link vale por 30 minutos e só pode ser usado uma vez. Se você não pediu isso, ignore este e-mail: sua senha continua a mesma.</p>
         </div>`);
+      console.log(enviado ? `esqueci-senha: e-mail enviado para ${email}.` : 'esqueci-senha: FALHA ao enviar o e-mail (veja o erro acima).');
     } catch (e) {
       console.error('Erro no esqueci-senha:', e.message);
     }

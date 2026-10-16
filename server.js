@@ -53,7 +53,7 @@ const SENHAS_FRACAS = ['admin123', '12345678', '123456789', '1234567890', 'passw
 const USUARIOS_PROIBIDOS = ['admin', 'administrador', 'root', 'master'];
 
 function validarSenha(senha, usuario) {
-  if (typeof senha !== 'string' || senha.length < 10) return 'A senha deve ter pelo menos 10 caracteres.';
+  if (typeof senha !== 'string' || senha.length < 8) return 'A senha deve ter pelo menos 8 caracteres.';
   if (senha.length > 72) return 'A senha deve ter no máximo 72 caracteres.';
   if (!/[A-Za-z]/.test(senha) || !/\d/.test(senha)) return 'A senha deve conter letras e números.';
   const baixa = senha.toLowerCase();

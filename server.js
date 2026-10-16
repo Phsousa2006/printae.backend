@@ -585,9 +585,10 @@ async function enviarCodigo(cliente, tipo) {
   await dbRun(`INSERT INTO clientes_codigos (cliente_id, tipo, codigo_hash, expira_em) VALUES (?, ?, ?, ?)`,
     [cliente.id, tipo, hashToken(`${cliente.id}:${tipo}:${codigo}`), Date.now() + 15 * 60 * 1000]);
 
-  const titulo = tipo === 'verificar' ? 'Confirme seu e-mail' : 'Recuperação de senha';
+  const titulo = tipo === 'verificar' ? 'Confirme seu e-mail' : tipo === 'login' ? 'Código de acesso' : 'Recuperação de senha';
   const texto = tipo === 'verificar'
     ? 'Use o código abaixo para confirmar seu e-mail e ativar sua conta:'
+    : tipo === 'login' ? 'Use o código abaixo para entrar na sua conta:'
     : 'Use o código abaixo para criar uma nova senha:';
   return enviarEmail(cliente.email, `${titulo} - ${NOME_LOJA}`, `
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#222">
@@ -608,20 +609,18 @@ async function conferirCodigo(clienteId, tipo, codigo) {
   return true;
 }
 
-// Cadastro: usuário, e-mail + confirmação, senha + confirmação. A conta só fica ativa após o código do e-mail.
+// Cadastro: usuário, e-mail, senha + confirmação da senha. A conta só fica ativa após digitar o código enviado ao e-mail.
 app.post('/api/clientes/cadastro', async (req, res) => {
   try {
     if (!limitar(`cad:${req.ip}`, 10, 60 * 60 * 1000)) return res.status(429).json({ error: 'Muitas tentativas. Aguarde um pouco e tente de novo.' });
     const usuario = String(req.body.usuario || '').trim();
     const email = normEmail(req.body.email);
-    const emailConf = normEmail(req.body.email_confirmacao);
     const senha = req.body.senha;
     const senhaConf = req.body.senha_confirmacao;
 
     const eUser = validarUsuarioCliente(usuario);
     if (eUser) return res.status(400).json({ error: eUser });
     if (!validarEmail(email)) return res.status(400).json({ error: 'Informe um e-mail válido.' });
-    if (email !== emailConf) return res.status(400).json({ error: 'Os e-mails não conferem.' });
     if (senha !== senhaConf) return res.status(400).json({ error: 'As senhas não conferem.' });
     const eSenha = validarSenha(senha, usuario);
     if (eSenha) return res.status(400).json({ error: eSenha });
@@ -648,32 +647,33 @@ app.post('/api/clientes/cadastro', async (req, res) => {
   } catch (e) { erroInterno(res, e); }
 });
 
-// Confirma o e-mail com o código recebido e já entra na conta
+// Confirma o código enviado por e-mail (cadastro OU login) e entra na conta
 app.post('/api/clientes/verificar-email', async (req, res) => {
   try {
     const email = normEmail(req.body.email);
     if (!limitar(`ver:${req.ip}:${email}`, 10, 15 * 60 * 1000)) return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
-    const c = await dbGet(`SELECT id, email, usuario FROM clientes WHERE email = ?`, [email]);
-    const ok = c && await conferirCodigo(c.id, 'verificar', req.body.codigo);
+    const c = await dbGet(`SELECT id, email, usuario, email_verificado FROM clientes WHERE email = ?`, [email]);
+    const tipo = c && c.email_verificado ? 'login' : 'verificar';
+    const ok = c && await conferirCodigo(c.id, tipo, req.body.codigo);
     if (!ok) return res.status(400).json({ error: 'Código inválido ou expirado. Peça um novo código.' });
-    await dbRun(`UPDATE clientes SET email_verificado = 1 WHERE id = ?`, [c.id]);
-    res.json({ token: tokenCliente(c), email: c.email, usuario: c.usuario, message: 'E-mail confirmado! Você já está logado.' });
+    if (!c.email_verificado) await dbRun(`UPDATE clientes SET email_verificado = 1 WHERE id = ?`, [c.id]);
+    res.json({ token: tokenCliente(c), email: c.email, usuario: c.usuario, message: 'Código confirmado! Você está logado.' });
   } catch (e) { erroInterno(res, e); }
 });
 
 // Reenvio do código (resposta sempre igual: não revela se o e-mail existe)
 app.post('/api/clientes/reenviar-codigo', async (req, res) => {
-  res.json({ message: 'Se o e-mail estiver aguardando confirmação, enviamos um novo código.' });
+  res.json({ message: 'Se o e-mail estiver cadastrado, enviamos um novo código.' });
   try {
     const email = normEmail(req.body.email);
     if (!validarEmail(email)) return;
     if (!limitar(`reenv-ip:${req.ip}`, 10, 60 * 60 * 1000) || !limitar(`reenv:${email}`, 4, 60 * 60 * 1000)) return;
-    const c = await dbGet(`SELECT id, email, usuario FROM clientes WHERE email = ? AND email_verificado = 0`, [email]);
-    if (c) await enviarCodigo(c, 'verificar');
+    const c = await dbGet(`SELECT id, email, usuario, email_verificado FROM clientes WHERE email = ?`, [email]);
+    if (c) await enviarCodigo(c, c.email_verificado ? 'login' : 'verificar');
   } catch (e) { console.error('reenviar-codigo:', e.message); }
 });
 
-// Login (somente com e-mail confirmado)
+// Login em 2 passos: (1) e-mail + senha -> envia código por e-mail; (2) /verificar-email com o código
 app.post('/api/clientes/login', async (req, res) => {
   try {
     const email = normEmail(req.body.email);
@@ -685,11 +685,10 @@ app.post('/api/clientes/login', async (req, res) => {
     const ok = await bcrypt.compare(senha, c ? c.senha : HASH_FALSO);
     if (!c || !ok) return res.status(401).json({ error: 'E-mail ou senha incorretos.' });
 
-    if (!c.email_verificado) {
-      if (limitar(`reenv:${email}`, 4, 60 * 60 * 1000)) await enviarCodigo(c, 'verificar');
-      return res.status(403).json({ code: 'EMAIL_NAO_VERIFICADO', error: 'Confirme seu e-mail para entrar. Enviamos um código para você.' });
-    }
-    res.json({ token: tokenCliente(c), email: c.email, usuario: c.usuario });
+    if (!limitar(`reenv:${email}`, 6, 60 * 60 * 1000)) return res.status(429).json({ error: 'Muitos códigos solicitados. Aguarde um pouco e tente de novo.' });
+    const enviado = await enviarCodigo(c, c.email_verificado ? 'login' : 'verificar');
+    if (!enviado) return res.status(502).json({ error: 'Não foi possível enviar o código por e-mail agora. Tente novamente em alguns minutos.' });
+    res.json({ codigo_enviado: true, message: 'Enviamos um código de 6 dígitos para o seu e-mail.' });
   } catch (e) { erroInterno(res, e); }
 });
 

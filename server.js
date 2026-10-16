@@ -2,10 +2,13 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || 'printae_secret_key_2026';
 
+app.set('trust proxy', 1); // Render fica atrás de proxy: necessário para o IP real (limite de tentativas)
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
@@ -22,6 +25,79 @@ function dbGet(sql, params = []) {
 }
 function parseLista(str) {
   try { const v = JSON.parse(str); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => db.run(sql, params, function (e) { return e ? reject(e) : resolve(this); }));
+}
+
+// URL pública onde o admin.html está hospedado (ex.: https://seusite.com.br/admin.html)
+const ADMIN_URL = process.env.ADMIN_URL || '';
+
+// ---- Limite de tentativas (em memória) ----
+const tentativas = new Map();
+function limitar(chave, max, janelaMs) {
+  const agora = Date.now();
+  let r = tentativas.get(chave);
+  if (!r || r.expira < agora) { r = { n: 0, expira: agora + janelaMs }; tentativas.set(chave, r); }
+  r.n++;
+  return r.n <= max;
+}
+setInterval(() => {
+  const agora = Date.now();
+  for (const [k, v] of tentativas) if (v.expira < agora) tentativas.delete(k);
+}, 10 * 60 * 1000).unref();
+
+// ---- Regras de senha / e-mail / usuário ----
+const SENHAS_FRACAS = ['admin123', '12345678', '123456789', '1234567890', 'password', 'senha123', 'admin1234', 'qwerty123', 'printae123'];
+const USUARIOS_PROIBIDOS = ['admin', 'administrador', 'root', 'master'];
+
+function validarSenha(senha, usuario) {
+  if (typeof senha !== 'string' || senha.length < 10) return 'A senha deve ter pelo menos 10 caracteres.';
+  if (senha.length > 72) return 'A senha deve ter no máximo 72 caracteres.';
+  if (!/[A-Za-z]/.test(senha) || !/\d/.test(senha)) return 'A senha deve conter letras e números.';
+  const baixa = senha.toLowerCase();
+  if (SENHAS_FRACAS.some(f => baixa.includes(f))) return 'Essa senha é muito comum. Escolha outra.';
+  if (usuario && baixa.includes(String(usuario).toLowerCase())) return 'A senha não pode conter o nome de usuário.';
+  return null;
+}
+function validarEmail(email) {
+  return typeof email === 'string' && email.length <= 120 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
+}
+function validarNomeUsuario(u) {
+  if (!/^[A-Za-z0-9._-]{3,40}$/.test(u)) return 'O usuário deve ter de 3 a 40 caracteres (letras, números, ponto, hífen ou sublinhado).';
+  if (USUARIOS_PROIBIDOS.includes(u.toLowerCase())) return 'Esse nome de usuário é muito previsível. Escolha outro.';
+  return null;
+}
+const esc = (t) => String(t).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+const HASH_FALSO = bcrypt.hashSync('senha-falsa-para-igualar-tempo', 10);
+
+// ---- E-mail via API HTTP (Brevo). SMTP é bloqueado no plano gratuito do Render. ----
+async function enviarEmail(para, assunto, html) {
+  const key = process.env.BREVO_API_KEY;
+  const remetente = process.env.MAIL_FROM;
+  if (!key || !remetente) {
+    console.error('E-mail NÃO enviado: defina BREVO_API_KEY e MAIL_FROM nas variáveis de ambiente.');
+    return false;
+  }
+  try {
+    const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': key, 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        sender: { name: process.env.MAIL_FROM_NAME || 'Printae.gyn', email: remetente },
+        to: [{ email: para }],
+        subject: assunto,
+        htmlContent: html
+      })
+    });
+    if (!r.ok) { console.error('Falha ao enviar e-mail:', r.status, await r.text()); return false; }
+    return true;
+  } catch (e) {
+    console.error('Erro ao enviar e-mail:', e.message);
+    return false;
+  }
 }
 
 // ==========================================
@@ -88,9 +164,51 @@ db.serialize(() => {
   // Coluna de status dos pedidos (erro de "coluna duplicada" é ignorado de propósito)
   db.run(`ALTER TABLE pedidos ADD COLUMN status TEXT DEFAULT 'aberto'`, () => {});
 
-  db.get(`SELECT * FROM usuarios WHERE is_master = 1`, (err, master) => {
-    if (!master) {
-      db.run(`INSERT INTO usuarios (usuario, senha, is_master) VALUES ('admin', 'admin123', 1)`);
+  // Recuperação de senha: e-mail e obrigação de trocar a senha no primeiro acesso
+  db.run(`ALTER TABLE usuarios ADD COLUMN email TEXT`, () => {});
+  db.run(`ALTER TABLE usuarios ADD COLUMN must_change_password INTEGER DEFAULT 0`, () => {});
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email)`);
+  db.run(`CREATE TABLE IF NOT EXISTS reset_senha (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    usuario_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL,
+    expira_em INTEGER NOT NULL
+  )`);
+
+  // Roda depois das migrações acima (o serialize garante a ordem)
+  db.all(`SELECT id, usuario, senha, is_master FROM usuarios`, [], async (err, rows) => {
+    if (err) return console.error('Erro na migração de senhas:', err.message);
+    try {
+      // 1) Converte senhas antigas (texto puro) para hash bcrypt
+      for (const u of rows) {
+        if (!String(u.senha).startsWith('$2')) {
+          u.senha = await bcrypt.hash(String(u.senha), 10);
+          await dbRun(`UPDATE usuarios SET senha = ? WHERE id = ?`, [u.senha, u.id]);
+        }
+      }
+
+      // 2) Garante um master seguro
+      const senhaEnv = process.env.ADMIN_INITIAL_PASSWORD;
+      const master = rows.find(u => u.is_master);
+      if (!master) {
+        const inicial = senhaEnv || crypto.randomBytes(12).toString('base64url');
+        await dbRun(
+          `INSERT INTO usuarios (usuario, senha, is_master, must_change_password) VALUES ('admin', ?, 1, 1)`,
+          [await bcrypt.hash(inicial, 10)]
+        );
+        if (!senhaEnv) console.log(`>>> SENHA INICIAL DO MASTER (usuário "admin"): ${inicial} <<< (troque no primeiro acesso)`);
+      } else if (await bcrypt.compare('admin123', master.senha)) {
+        // Master ainda com a senha padrão antiga: obriga a troca
+        if (senhaEnv) {
+          await dbRun(`UPDATE usuarios SET senha = ?, must_change_password = 1 WHERE id = ?`, [await bcrypt.hash(senhaEnv, 10), master.id]);
+          console.log('Senha padrão do master substituída por ADMIN_INITIAL_PASSWORD. Troca obrigatória no primeiro acesso.');
+        } else {
+          await dbRun(`UPDATE usuarios SET must_change_password = 1 WHERE id = ?`, [master.id]);
+          console.warn('ATENÇÃO: o master ainda usa a senha padrão! Defina ADMIN_INITIAL_PASSWORD e reinicie, ou acesse o painel agora para trocá-la.');
+        }
+      }
+    } catch (e) {
+      console.error('Erro ao preparar usuário master:', e.message);
     }
   });
 });
@@ -109,6 +227,22 @@ function autenticarAdmin(req, res, next) {
     if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
     if (!user || typeof user.usuario !== 'string' || user.email) {
       return res.status(403).json({ error: 'Token não pertence a um administrador.' });
+    }
+    // Token provisório (primeiro acesso) só serve para concluir o primeiro acesso
+    if (user.setup) return res.status(403).json({ error: 'Conclua o primeiro acesso antes de continuar.', code: 'MUST_CHANGE_PASSWORD' });
+    req.user = user;
+    next();
+  });
+}
+
+// Aceita SOMENTE o token provisório emitido quando a troca de senha é obrigatória
+function autenticarSetup(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Acesso negado.' });
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err || !user || !user.setup || typeof user.usuario !== 'string') {
+      return res.status(403).json({ error: 'Sessão de primeiro acesso inválida ou expirada. Faça login novamente.' });
     }
     req.user = user;
     next();
@@ -164,22 +298,147 @@ async function validarConcessao(admin, cargo_id, permissoesIndividuais) {
 // ==========================================
 // LOGIN ADMIN
 // ==========================================
-app.post('/api/login', (req, res) => {
-  const { usuario, senha } = req.body;
-  db.get(`SELECT id FROM usuarios WHERE usuario = ? AND senha = ?`, [usuario, senha], async (err, row) => {
-    if (err || !row) return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
-    try {
-      const atual = await carregarPermissoes(row.id);
-      const token = jwt.sign(
-        { id: atual.id, usuario: atual.usuario, is_master: atual.is_master ? 1 : 0 },
-        JWT_SECRET,
-        { expiresIn: '12h' }
-      );
-      res.json({ token, usuario: atual.usuario, is_master: atual.is_master, permissoes: atual.permissoes });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
+app.post('/api/login', async (req, res) => {
+  const usuario = String(req.body.usuario || '').trim();
+  const senha = String(req.body.senha || '');
+  if (!limitar(`login:${req.ip}:${usuario.toLowerCase()}`, 10, 15 * 60 * 1000)) {
+    return res.status(429).json({ error: 'Muitas tentativas. Aguarde 15 minutos e tente novamente.' });
+  }
+  try {
+    const row = await dbGet(`SELECT id, usuario, senha, is_master, email, must_change_password FROM usuarios WHERE usuario = ?`, [usuario]);
+    // compara sempre (mesmo sem usuário) para não revelar quais usuários existem pelo tempo de resposta
+    const ok = await bcrypt.compare(senha, row ? row.senha : HASH_FALSO);
+    if (!row || !ok) return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
+
+    // Primeiro acesso: troca de senha pendente OU master ainda sem e-mail de recuperação cadastrado
+    if (row.must_change_password || (row.is_master && !row.email)) {
+      const setupToken = jwt.sign({ id: row.id, usuario: row.usuario, setup: true }, JWT_SECRET, { expiresIn: '30m' });
+      return res.json({ must_change_password: true, setup_token: setupToken, usuario: row.usuario, is_master: !!row.is_master });
     }
-  });
+
+    const atual = await carregarPermissoes(row.id);
+    const token = jwt.sign(
+      { id: atual.id, usuario: atual.usuario, is_master: atual.is_master ? 1 : 0 },
+      JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+    res.json({ token, usuario: atual.usuario, is_master: atual.is_master, permissoes: atual.permissoes });
+  } catch (e) {
+    res.status(500).json({ error: 'Erro interno ao fazer login.' });
+  }
+});
+
+// Primeiro acesso.
+// MASTER: define usuário, e-mail (recuperação de senha) e senha nova.
+// Demais usuários: apenas trocam a senha provisória (sem e-mail, sem mudar o usuário).
+app.post('/api/conta/primeiro-acesso', autenticarSetup, async (req, res) => {
+  try {
+    const row = await dbGet(`SELECT id, usuario, is_master, email, must_change_password FROM usuarios WHERE id = ?`, [req.user.id]);
+    const pendente = row && (row.must_change_password || (row.is_master && !row.email));
+    if (!pendente) return res.status(400).json({ error: 'Este usuário não precisa de primeiro acesso.' });
+
+    const senhaNova = req.body.senha_nova;
+    let novoUsuario = row.usuario;
+    let email = row.email || null;
+
+    if (row.is_master) {
+      novoUsuario = String(req.body.usuario || row.usuario).trim();
+      email = String(req.body.email || '').trim().toLowerCase();
+      const eUser = validarNomeUsuario(novoUsuario);
+      if (eUser) return res.status(400).json({ error: eUser });
+      if (!validarEmail(email)) return res.status(400).json({ error: 'Informe um e-mail válido. Ele será usado para recuperar sua senha.' });
+
+      const dupUser = await dbGet(`SELECT id FROM usuarios WHERE usuario = ? AND id != ?`, [novoUsuario, row.id]);
+      if (dupUser) return res.status(409).json({ error: 'Esse nome de usuário já está em uso.' });
+      const dupEmail = await dbGet(`SELECT id FROM usuarios WHERE email = ? AND id != ?`, [email, row.id]);
+      if (dupEmail) return res.status(409).json({ error: 'Esse e-mail já está em uso.' });
+    }
+
+    const eSenha = validarSenha(senhaNova, novoUsuario);
+    if (eSenha) return res.status(400).json({ error: eSenha });
+
+    await dbRun(
+      `UPDATE usuarios SET usuario = ?, email = ?, senha = ?, must_change_password = 0 WHERE id = ?`,
+      [novoUsuario, email, await bcrypt.hash(senhaNova, 10), row.id]
+    );
+    await dbRun(`DELETE FROM reset_senha WHERE usuario_id = ?`, [row.id]);
+
+    const atual = await carregarPermissoes(row.id);
+    const token = jwt.sign(
+      { id: atual.id, usuario: atual.usuario, is_master: atual.is_master ? 1 : 0 },
+      JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+    res.json({ token, usuario: atual.usuario, is_master: atual.is_master, permissoes: atual.permissoes });
+  } catch (e) {
+    res.status(500).json({ error: 'Erro interno ao concluir o primeiro acesso.' });
+  }
+});
+
+// "Esqueci a senha": sempre responde igual, exista ou não o e-mail (não revela cadastros)
+app.post('/api/esqueci-senha', (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const resposta = { message: 'Se esse e-mail estiver cadastrado, você receberá um link para redefinir a senha em instantes.' };
+  res.json(resposta);
+
+  // processamento em segundo plano (também evita diferença de tempo entre e-mail existente e inexistente)
+  (async () => {
+    try {
+      if (!validarEmail(email)) return;
+      if (!limitar(`esqueci-ip:${req.ip}`, 5, 60 * 60 * 1000)) return;
+      if (!limitar(`esqueci-email:${email}`, 3, 60 * 60 * 1000)) return;
+      if (!ADMIN_URL) return console.error('ADMIN_URL não definida: não é possível montar o link de recuperação.');
+
+      const u = await dbGet(`SELECT id, usuario FROM usuarios WHERE email = ? AND is_master = 1`, [email]); // recuperação por e-mail: somente master
+      if (!u) return;
+
+      const token = crypto.randomBytes(32).toString('hex');
+      await dbRun(`DELETE FROM reset_senha WHERE usuario_id = ?`, [u.id]); // invalida links anteriores
+      await dbRun(`INSERT INTO reset_senha (usuario_id, token_hash, expira_em) VALUES (?, ?, ?)`, [u.id, hashToken(token), Date.now() + 30 * 60 * 1000]);
+
+      const link = `${ADMIN_URL}#reset=${token}`;
+      await enviarEmail(email, 'Redefinição de senha - Painel Printae.gyn', `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#222">
+          <h2>Redefinir senha</h2>
+          <p>Olá, <b>${esc(u.usuario)}</b>! Recebemos um pedido para redefinir a senha do painel administrativo.</p>
+          <p><a href="${link}" style="display:inline-block;background:#6b2fd1;color:#fff;padding:12px 22px;border-radius:10px;text-decoration:none;font-weight:bold">Criar nova senha</a></p>
+          <p style="font-size:13px;color:#555">Este link vale por 30 minutos e só pode ser usado uma vez. Se você não pediu isso, ignore este e-mail: sua senha continua a mesma.</p>
+        </div>`);
+    } catch (e) {
+      console.error('Erro no esqueci-senha:', e.message);
+    }
+  })();
+});
+
+// Confirma a redefinição usando o link recebido por e-mail
+app.post('/api/redefinir-senha', async (req, res) => {
+  if (!limitar(`redefinir:${req.ip}`, 10, 15 * 60 * 1000)) {
+    return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
+  }
+  try {
+    const { token, senha_nova } = req.body;
+    if (!token || typeof token !== 'string') return res.status(400).json({ error: 'Link inválido.' });
+
+    const r = await dbGet(`SELECT usuario_id FROM reset_senha WHERE token_hash = ? AND expira_em > ?`, [hashToken(token), Date.now()]);
+    if (!r) return res.status(400).json({ error: 'Link inválido ou expirado. Solicite um novo em "Esqueci minha senha".' });
+
+    const u = await dbGet(`SELECT id, usuario, email FROM usuarios WHERE id = ?`, [r.usuario_id]);
+    if (!u) return res.status(400).json({ error: 'Link inválido.' });
+
+    const eSenha = validarSenha(senha_nova, u.usuario);
+    if (eSenha) return res.status(400).json({ error: eSenha });
+
+    await dbRun(`UPDATE usuarios SET senha = ?, must_change_password = 0 WHERE id = ?`, [await bcrypt.hash(senha_nova, 10), u.id]);
+    await dbRun(`DELETE FROM reset_senha WHERE usuario_id = ?`, [u.id]); // link de uso único
+
+    if (u.email) {
+      enviarEmail(u.email, 'Sua senha foi alterada - Painel Printae.gyn',
+        `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto"><p>Olá, <b>${esc(u.usuario)}</b>. A senha do painel administrativo acabou de ser alterada. Se não foi você, entre em contato com o administrador imediatamente.</p></div>`);
+    }
+    res.json({ message: 'Senha redefinida com sucesso! Faça login com a nova senha.' });
+  } catch (e) {
+    res.status(500).json({ error: 'Erro interno ao redefinir a senha.' });
+  }
 });
 
 // Quem sou eu + permissões efetivas ATUAIS (o painel usa isto para montar o menu)
@@ -461,12 +720,15 @@ app.post('/api/usuarios', ...exigirPermissao('adicionar_admin'), async (req, res
   const { usuario, senha, cargo_id, permissoes_individuais } = req.body;
   if (!usuario || !senha) return res.status(400).json({ error: 'Usuário e senha são obrigatórios.' });
   try {
+    const eSenha = validarSenha(senha, usuario);
+    if (eSenha) return res.status(400).json({ error: eSenha });
     const negado = await validarConcessao(req.admin, cargo_id, permissoes_individuais);
     if (negado) return res.status(403).json({ error: negado });
 
+    // A senha definida aqui é provisória: o novo usuário será obrigado a trocá-la (e informar e-mail) no primeiro acesso
     db.run(
-      `INSERT INTO usuarios (usuario, senha, is_master, cargo_id, permissoes_individuais) VALUES (?, ?, 0, ?, ?)`,
-      [usuario, senha, cargo_id || null, JSON.stringify(permissoes_individuais || [])],
+      `INSERT INTO usuarios (usuario, senha, is_master, cargo_id, permissoes_individuais, must_change_password) VALUES (?, ?, 0, ?, ?, 1)`,
+      [usuario, await bcrypt.hash(senha, 10), cargo_id || null, JSON.stringify(permissoes_individuais || [])],
       function (err) {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ id: this.lastID, message: 'Usuário admin criado!' });
@@ -509,7 +771,16 @@ app.put('/api/usuarios/:id', autenticarAdmin, async (req, res) => {
       sets.push('usuario = ?', 'cargo_id = ?', 'permissoes_individuais = ?');
       params.push(usuario, cargo_id || null, JSON.stringify(permissoes_individuais || []));
     }
-    if (temSenha) { sets.push('senha = ?'); params.push(senha); }
+    if (temSenha) {
+      const alvo = await dbGet(`SELECT usuario FROM usuarios WHERE id = ? AND is_master = 0`, [id]);
+      if (!alvo) return res.status(404).json({ error: 'Usuário não encontrado.' });
+      const eSenha = validarSenha(senha, usuario || alvo.usuario);
+      if (eSenha) return res.status(400).json({ error: eSenha });
+      // senha definida por outra pessoa é provisória: o usuário precisa trocá-la ao entrar
+      sets.push('senha = ?', 'must_change_password = ?');
+      params.push(await bcrypt.hash(senha, 10), String(id) === String(atual.id) ? 0 : 1);
+      await dbRun(`DELETE FROM reset_senha WHERE usuario_id = ?`, [id]);
+    }
     params.push(id);
 
     db.run(`UPDATE usuarios SET ${sets.join(', ')} WHERE id = ? AND is_master = 0`, params, (err) => {

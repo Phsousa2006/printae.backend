@@ -187,6 +187,18 @@ db.serialize(() => {
         }
       }
 
+      // 1b) Recuperação de emergência: defina RESET_MASTER_PASSWORD no Render, reinicie, entre com a
+      //     senha definida e REMOVA a variável em seguida (senão a senha é redefinida a cada reinicialização).
+      const senhaReset = process.env.RESET_MASTER_PASSWORD;
+      if (senhaReset) {
+        const m = rows.find(u => u.is_master);
+        if (m) {
+          m.senha = await bcrypt.hash(senhaReset, 10);
+          await dbRun(`UPDATE usuarios SET senha = ?, must_change_password = 1 WHERE id = ?`, [m.senha, m.id]);
+          console.log(`>>> RESET DO MASTER: entre com o usuário "${m.usuario}" e a senha de RESET_MASTER_PASSWORD. Depois REMOVA essa variável. <<<`);
+        }
+      }
+
       // 2) Garante um master seguro
       const senhaEnv = process.env.ADMIN_INITIAL_PASSWORD;
       const master = rows.find(u => u.is_master);

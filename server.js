@@ -32,7 +32,11 @@ function dbRun(sql, params = []) {
 }
 
 // URL pública onde o admin.html está hospedado (ex.: https://seusite.com.br/admin.html)
-const ADMIN_URL = process.env.ADMIN_URL || '';
+const ADMIN_URL = String(process.env.ADMIN_URL || '').trim().replace(/[#?].*$/, '');
+
+// Mostra no log (sem revelar valores) quais variáveis de e-mail estão configuradas
+const _v = (n) => (String(process.env[n] || '').trim() ? 'OK' : 'FALTANDO');
+console.log(`Config de e-mail -> ADMIN_URL: ${_v('ADMIN_URL')} | BREVO_API_KEY: ${_v('BREVO_API_KEY')} | MAIL_FROM: ${_v('MAIL_FROM')}`);
 
 // ---- Limite de tentativas (em memória) ----
 const tentativas = new Map();

@@ -203,12 +203,12 @@ db.serialize(() => {
       const senhaEnv = process.env.ADMIN_INITIAL_PASSWORD;
       const master = rows.find(u => u.is_master);
       if (!master) {
-        const inicial = senhaEnv || crypto.randomBytes(12).toString('base64url');
+        const inicial = senhaEnv || senhaReset || crypto.randomBytes(12).toString('base64url');
         await dbRun(
           `INSERT INTO usuarios (usuario, senha, is_master, must_change_password) VALUES ('admin', ?, 1, 1)`,
           [await bcrypt.hash(inicial, 10)]
         );
-        if (!senhaEnv) console.log(`>>> SENHA INICIAL DO MASTER (usuário "admin"): ${inicial} <<< (troque no primeiro acesso)`);
+        if (!senhaEnv && !senhaReset) console.log(`>>> SENHA INICIAL DO MASTER (usuário "admin"): ${inicial} <<< (troque no primeiro acesso)`);
       } else if (await bcrypt.compare('admin123', master.senha)) {
         // Master ainda com a senha padrão antiga: obriga a troca
         if (senhaEnv) {

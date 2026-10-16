@@ -6,13 +6,63 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
 const app = express();
-const JWT_SECRET = process.env.JWT_SECRET || 'printae_secret_key_2026';
 
+// ---- Segredo do JWT: NUNCA fica no código (o repositório é público) ----
+// Defina JWT_SECRET no Render (Environment). Sem ele, usamos um segredo aleatório temporário:
+// o site funciona, mas todos precisam fazer login de novo a cada reinicialização.
+let JWT_SECRET = String(process.env.JWT_SECRET || '').trim();
+if (JWT_SECRET.length < 32) {
+  JWT_SECRET = crypto.randomBytes(48).toString('hex');
+  console.warn('ATENÇÃO: JWT_SECRET não definido (ou com menos de 32 caracteres). Usando segredo temporário; defina JWT_SECRET no Render.');
+}
+const JWT_OPTS = { algorithms: ['HS256'] };
+
+app.disable('x-powered-by');
 app.set('trust proxy', 1); // Render fica atrás de proxy: necessário para o IP real (limite de tentativas)
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
 
-const db = new sqlite3.Database('./database.db', (err) => {
+// ---- CORS: só os sites autorizados podem chamar a API pelo navegador ----
+// ALLOWED_ORIGINS = endereços do site e do painel, separados por vírgula (sem barra no final).
+// Ex.: https://www.printae.com.br,https://printae.com.br
+const ORIGENS = String(process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim().replace(/\/$/, '')).filter(Boolean);
+if (!ORIGENS.length) console.warn('ATENÇÃO: ALLOWED_ORIGINS não definido. A API está aceitando qualquer origem (CORS aberto).');
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || !ORIGENS.length || ORIGENS.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  }
+}));
+
+// ---- Cabeçalhos de segurança ----
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
+// ---- Tamanho do corpo: 50 MB só para rotas de ADMIN que recebem imagens; o resto aceita pouco ----
+const ROTAS_COM_IMAGEM = ['/api/banners', '/api/categorias', '/api/produtos', '/api/configuracoes'];
+app.use(ROTAS_COM_IMAGEM, (req, res, next) => {
+  if (req.method === 'GET' || req.method === 'DELETE') return next();
+  // exige token válido ANTES de aceitar um corpo grande
+  const t = (req.headers['authorization'] || '').split(' ')[1];
+  jwt.verify(t || '', JWT_SECRET, JWT_OPTS, (err, p) => {
+    if (err || !p || typeof p.usuario !== 'string' || p.setup) return res.status(401).json({ error: 'Acesso negado.' });
+    express.json({ limit: '50mb' })(req, res, next);
+  });
+});
+app.use(express.json({ limit: '50kb' }));
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.type === 'entity.parse.failed')) {
+    return res.status(400).json({ error: 'Requisição inválida.' });
+  }
+  next(err);
+});
+
+const DB_PATH = process.env.DB_PATH || './database.db'; // no Render, use um Disk persistente (ex.: /var/data/database.db)
+const db = new sqlite3.Database(DB_PATH, (err) => {
   if (err) console.error("Erro ao abrir banco SQLite:", err.message);
   else console.log("Banco SQLite conectado com sucesso.");
 });
@@ -25,6 +75,14 @@ function dbGet(sql, params = []) {
 }
 function parseLista(str) {
   try { const v = JSON.parse(str); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+
+function erroInterno(res, e) {
+  console.error('Erro interno:', e && e.message ? e.message : e);
+  return res.status(500).json({ error: 'Erro interno. Tente novamente em instantes.' });
+}
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => db.all(sql, params, (e, r) => (e ? reject(e) : resolve(r))));
 }
 
 function dbRun(sql, params = []) {
@@ -82,7 +140,7 @@ async function enviarEmail(para, assunto, html) {
   const key = process.env.BREVO_API_KEY;
   const remetente = process.env.MAIL_FROM;
   if (!key || !remetente) {
-    console.error('E-mail NÃO enviado: defina BREVO_API_KEY e MAIL_FROM nas variáveis de ambiente.');
+    console.error('E-mail NÃO enviado: defina BREVO_API_KEY e MAIL_FROM nas variáveis de ambiente do Render.');
     return false;
   }
   try {
@@ -165,6 +223,30 @@ db.serialize(() => {
     data TEXT NOT NULL
   )`);
 
+  // Clientes: usuário, e-mail verificado e códigos de confirmação / recuperação
+  db.run(`ALTER TABLE clientes ADD COLUMN usuario TEXT`, () => {});
+  db.run(`ALTER TABLE clientes ADD COLUMN email_verificado INTEGER DEFAULT 0`, () => {});
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_clientes_usuario ON clientes(usuario COLLATE NOCASE)`);
+  db.run(`CREATE TABLE IF NOT EXISTS clientes_codigos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cliente_id INTEGER NOT NULL,
+    tipo TEXT NOT NULL,
+    codigo_hash TEXT NOT NULL,
+    expira_em INTEGER NOT NULL,
+    tentativas INTEGER DEFAULT 0
+  )`);
+  // Senhas antigas de clientes (texto puro) passam a ser guardadas como hash
+  db.all(`SELECT id, senha FROM clientes`, [], async (err, rows) => {
+    if (err) return console.error('Erro na migração de senhas de clientes:', err.message);
+    try {
+      for (const c of rows) {
+        if (!String(c.senha).startsWith('$2')) {
+          await dbRun(`UPDATE clientes SET senha = ? WHERE id = ?`, [await bcrypt.hash(String(c.senha), 10), c.id]);
+        }
+      }
+    } catch (e) { console.error('Erro ao converter senhas de clientes:', e.message); }
+  });
+
   // Coluna de status dos pedidos (erro de "coluna duplicada" é ignorado de propósito)
   db.run(`ALTER TABLE pedidos ADD COLUMN status TEXT DEFAULT 'aberto'`, () => {});
 
@@ -239,9 +321,9 @@ function autenticarAdmin(req, res, next) {
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'Acesso negado. Token não fornecido.' });
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, JWT_SECRET, JWT_OPTS, (err, user) => {
     if (err) return res.status(403).json({ error: 'Token inválido ou expirado.' });
-    if (!user || typeof user.usuario !== 'string' || user.email) {
+    if (!user || typeof user.usuario !== 'string' || user.email || user.tipo === 'cliente') {
       return res.status(403).json({ error: 'Token não pertence a um administrador.' });
     }
     // Token provisório (primeiro acesso) só serve para concluir o primeiro acesso
@@ -256,7 +338,7 @@ function autenticarSetup(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'Acesso negado.' });
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, JWT_SECRET, JWT_OPTS, (err, user) => {
     if (err || !user || !user.setup || typeof user.usuario !== 'string') {
       return res.status(403).json({ error: 'Sessão de primeiro acesso inválida ou expirada. Faça login novamente.' });
     }
@@ -291,7 +373,7 @@ function exigirPermissao(...necessarias) {
       if (atual.is_master || necessarias.some(p => atual.permissoes.includes(p))) return next();
       return res.status(403).json({ error: 'Você não tem permissão para realizar esta ação.' });
     } catch (e) {
-      return res.status(500).json({ error: e.message });
+      return erroInterno(res, e);
     }
   }];
 }
@@ -466,58 +548,213 @@ app.get('/api/me', autenticarAdmin, async (req, res) => {
     if (!atual) return res.status(401).json({ error: 'Usuário não existe mais.' });
     res.json(atual);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    erroInterno(res, e);
   }
 });
 
 // ==========================================
-// ROTAS DE CLIENTES (CADASTRO / LOGIN)
+// CLIENTES: CADASTRO, CONFIRMAÇÃO DE E-MAIL, LOGIN E RECUPERAÇÃO
 // ==========================================
-app.post('/api/clientes/auth', (req, res) => {
-  const { email, senha } = req.body;
-  if (!email || !senha) return res.status(400).json({ error: 'E-mail e senha obrigatórios.' });
+const NOME_LOJA = process.env.MAIL_FROM_NAME || 'Printae.gyn';
 
-  db.get(`SELECT * FROM clientes WHERE email = ?`, [email], (err, cliente) => {
-    if (err) return res.status(500).json({ error: err.message });
+function validarUsuarioCliente(u) {
+  if (!/^[A-Za-z0-9._-]{3,30}$/.test(u)) return 'O nome de usuário deve ter de 3 a 30 caracteres (letras, números, ponto, hífen ou sublinhado).';
+  if (USUARIOS_PROIBIDOS.includes(u.toLowerCase())) return 'Esse nome de usuário não está disponível. Escolha outro.';
+  return null;
+}
+const normEmail = (e) => String(e || '').trim().toLowerCase();
 
-    if (!cliente) {
-      db.run(`INSERT INTO clientes (email, senha) VALUES (?, ?)`, [email, senha], function (err) {
-        if (err) return res.status(500).json({ error: err.message });
-        const token = jwt.sign({ id: this.lastID, email }, JWT_SECRET, { expiresIn: '30d' });
-        res.json({ token, email, message: 'Conta criada e login efetuado com sucesso!' });
-      });
-    } else {
-      if (cliente.senha !== senha) {
-        return res.status(401).json({ error: 'Senha incorreta.' });
-      }
-      const token = jwt.sign({ id: cliente.id, email: cliente.email }, JWT_SECRET, { expiresIn: '30d' });
-      res.json({ token, email: cliente.email, message: 'Login efetuado com sucesso!' });
-    }
+function tokenCliente(c) {
+  return jwt.sign({ id: c.id, email: c.email, tipo: 'cliente' }, JWT_SECRET, { expiresIn: '30d' });
+}
+
+function autenticarCliente(req, res, next) {
+  const token = (req.headers['authorization'] || '').split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Faça login para continuar.' });
+  jwt.verify(token, JWT_SECRET, JWT_OPTS, (err, u) => {
+    if (err || !u || u.tipo !== 'cliente') return res.status(401).json({ error: 'Sessão expirada. Faça login novamente.' });
+    req.cliente = u;
+    next();
   });
-});
+}
 
-// ==========================================
-// PEDIDOS DO CLIENTE
-// ==========================================
-app.post('/api/pedidos', (req, res) => {
-  const { cliente_email, itens, subtotal, frete, total, data } = req.body;
-  if (!cliente_email || !itens) return res.status(400).json({ error: 'Dados do pedido incompletos.' });
+// Gera um código de 6 dígitos, guarda só o hash e envia por e-mail
+async function enviarCodigo(cliente, tipo) {
+  const codigo = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  await dbRun(`DELETE FROM clientes_codigos WHERE cliente_id = ? AND tipo = ?`, [cliente.id, tipo]);
+  await dbRun(`INSERT INTO clientes_codigos (cliente_id, tipo, codigo_hash, expira_em) VALUES (?, ?, ?, ?)`,
+    [cliente.id, tipo, hashToken(`${cliente.id}:${tipo}:${codigo}`), Date.now() + 15 * 60 * 1000]);
 
-  const itensStr = JSON.stringify(itens);
-  db.run(
-    `INSERT INTO pedidos (cliente_email, itens, subtotal, frete, total, data, status) VALUES (?, ?, ?, ?, ?, ?, 'aberto')`,
-    [cliente_email, itensStr, subtotal, frete, total, data || new Date().toLocaleDateString('pt-BR')],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ id: this.lastID, message: 'Pedido registrado com sucesso!' });
+  const titulo = tipo === 'verificar' ? 'Confirme seu e-mail' : 'Recuperação de senha';
+  const texto = tipo === 'verificar'
+    ? 'Use o código abaixo para confirmar seu e-mail e ativar sua conta:'
+    : 'Use o código abaixo para criar uma nova senha:';
+  return enviarEmail(cliente.email, `${titulo} - ${NOME_LOJA}`, `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#222">
+      <h2>${titulo}</h2>
+      <p>Olá${cliente.usuario ? ', <b>' + esc(cliente.usuario) + '</b>' : ''}! ${texto}</p>
+      <p style="font-size:34px;letter-spacing:8px;font-weight:bold;background:#f3eefc;padding:14px 18px;border-radius:12px;text-align:center">${codigo}</p>
+      <p style="font-size:13px;color:#555">O código vale por 15 minutos. Se não foi você, ignore este e-mail: nada será alterado.</p>
+    </div>`);
+}
+
+// Confere o código (máx. 5 tentativas, uso único). Retorna true/false.
+async function conferirCodigo(clienteId, tipo, codigo) {
+  const r = await dbGet(`SELECT id, codigo_hash, expira_em, tentativas FROM clientes_codigos WHERE cliente_id = ? AND tipo = ?`, [clienteId, tipo]);
+  if (!r || r.expira_em < Date.now() || r.tentativas >= 5) return false;
+  const ok = hashToken(`${clienteId}:${tipo}:${String(codigo || '').trim()}`) === r.codigo_hash;
+  if (!ok) { await dbRun(`UPDATE clientes_codigos SET tentativas = tentativas + 1 WHERE id = ?`, [r.id]); return false; }
+  await dbRun(`DELETE FROM clientes_codigos WHERE id = ?`, [r.id]);
+  return true;
+}
+
+// Cadastro: usuário, e-mail + confirmação, senha + confirmação. A conta só fica ativa após o código do e-mail.
+app.post('/api/clientes/cadastro', async (req, res) => {
+  try {
+    if (!limitar(`cad:${req.ip}`, 10, 60 * 60 * 1000)) return res.status(429).json({ error: 'Muitas tentativas. Aguarde um pouco e tente de novo.' });
+    const usuario = String(req.body.usuario || '').trim();
+    const email = normEmail(req.body.email);
+    const emailConf = normEmail(req.body.email_confirmacao);
+    const senha = req.body.senha;
+    const senhaConf = req.body.senha_confirmacao;
+
+    const eUser = validarUsuarioCliente(usuario);
+    if (eUser) return res.status(400).json({ error: eUser });
+    if (!validarEmail(email)) return res.status(400).json({ error: 'Informe um e-mail válido.' });
+    if (email !== emailConf) return res.status(400).json({ error: 'Os e-mails não conferem.' });
+    if (senha !== senhaConf) return res.status(400).json({ error: 'As senhas não conferem.' });
+    const eSenha = validarSenha(senha, usuario);
+    if (eSenha) return res.status(400).json({ error: eSenha });
+
+    const existente = await dbGet(`SELECT id, email_verificado FROM clientes WHERE email = ?`, [email]);
+    if (existente && existente.email_verificado) {
+      return res.status(409).json({ error: 'Este e-mail já está cadastrado. Entre na sua conta ou use "Esqueci minha senha".' });
     }
-  );
+    const outro = await dbGet(`SELECT id FROM clientes WHERE usuario = ? COLLATE NOCASE AND email != ?`, [usuario, email]);
+    if (outro) return res.status(409).json({ error: 'Esse nome de usuário já está em uso.' });
+
+    const hash = await bcrypt.hash(senha, 10);
+    let id;
+    if (existente) { // cadastro anterior nunca confirmado: atualiza e reenvia o código
+      await dbRun(`UPDATE clientes SET usuario = ?, senha = ? WHERE id = ?`, [usuario, hash, existente.id]);
+      id = existente.id;
+    } else {
+      const r = await dbRun(`INSERT INTO clientes (email, senha, usuario, email_verificado) VALUES (?, ?, ?, 0)`, [email, hash, usuario]);
+      id = r.lastID;
+    }
+    const enviado = await enviarCodigo({ id, email, usuario }, 'verificar');
+    if (!enviado) return res.status(502).json({ error: 'Não foi possível enviar o e-mail de confirmação agora. Tente novamente em alguns minutos.' });
+    res.json({ message: 'Enviamos um código de 6 dígitos para o seu e-mail. Digite-o para ativar a conta.' });
+  } catch (e) { erroInterno(res, e); }
 });
 
-app.get('/api/pedidos/:email', (req, res) => {
-  db.all(`SELECT * FROM pedidos WHERE cliente_email = ? ORDER BY id DESC`, [req.params.email], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows.map(p => ({ ...p, itens: parseLista(p.itens) })));
+// Confirma o e-mail com o código recebido e já entra na conta
+app.post('/api/clientes/verificar-email', async (req, res) => {
+  try {
+    const email = normEmail(req.body.email);
+    if (!limitar(`ver:${req.ip}:${email}`, 10, 15 * 60 * 1000)) return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
+    const c = await dbGet(`SELECT id, email, usuario FROM clientes WHERE email = ?`, [email]);
+    const ok = c && await conferirCodigo(c.id, 'verificar', req.body.codigo);
+    if (!ok) return res.status(400).json({ error: 'Código inválido ou expirado. Peça um novo código.' });
+    await dbRun(`UPDATE clientes SET email_verificado = 1 WHERE id = ?`, [c.id]);
+    res.json({ token: tokenCliente(c), email: c.email, usuario: c.usuario, message: 'E-mail confirmado! Você já está logado.' });
+  } catch (e) { erroInterno(res, e); }
+});
+
+// Reenvio do código (resposta sempre igual: não revela se o e-mail existe)
+app.post('/api/clientes/reenviar-codigo', async (req, res) => {
+  res.json({ message: 'Se o e-mail estiver aguardando confirmação, enviamos um novo código.' });
+  try {
+    const email = normEmail(req.body.email);
+    if (!validarEmail(email)) return;
+    if (!limitar(`reenv-ip:${req.ip}`, 10, 60 * 60 * 1000) || !limitar(`reenv:${email}`, 4, 60 * 60 * 1000)) return;
+    const c = await dbGet(`SELECT id, email, usuario FROM clientes WHERE email = ? AND email_verificado = 0`, [email]);
+    if (c) await enviarCodigo(c, 'verificar');
+  } catch (e) { console.error('reenviar-codigo:', e.message); }
+});
+
+// Login (somente com e-mail confirmado)
+app.post('/api/clientes/login', async (req, res) => {
+  try {
+    const email = normEmail(req.body.email);
+    const senha = String(req.body.senha || '');
+    if (!email || !senha) return res.status(400).json({ error: 'Informe e-mail e senha.' });
+    if (!limitar(`clogin:${req.ip}:${email}`, 10, 15 * 60 * 1000)) return res.status(429).json({ error: 'Muitas tentativas. Aguarde 15 minutos.' });
+
+    const c = await dbGet(`SELECT id, email, usuario, senha, email_verificado FROM clientes WHERE email = ?`, [email]);
+    const ok = await bcrypt.compare(senha, c ? c.senha : HASH_FALSO);
+    if (!c || !ok) return res.status(401).json({ error: 'E-mail ou senha incorretos.' });
+
+    if (!c.email_verificado) {
+      if (limitar(`reenv:${email}`, 4, 60 * 60 * 1000)) await enviarCodigo(c, 'verificar');
+      return res.status(403).json({ code: 'EMAIL_NAO_VERIFICADO', error: 'Confirme seu e-mail para entrar. Enviamos um código para você.' });
+    }
+    res.json({ token: tokenCliente(c), email: c.email, usuario: c.usuario });
+  } catch (e) { erroInterno(res, e); }
+});
+
+// Recuperação de senha do cliente: passo 1 (pede o código)
+app.post('/api/clientes/esqueci-senha', async (req, res) => {
+  res.json({ message: 'Se esse e-mail estiver cadastrado, enviamos um código para redefinir a senha.' });
+  try {
+    const email = normEmail(req.body.email);
+    if (!validarEmail(email)) return;
+    if (!limitar(`cesq-ip:${req.ip}`, 10, 60 * 60 * 1000) || !limitar(`cesq:${email}`, 3, 60 * 60 * 1000)) return;
+    const c = await dbGet(`SELECT id, email, usuario FROM clientes WHERE email = ? AND email_verificado = 1`, [email]);
+    if (c) await enviarCodigo(c, 'reset');
+  } catch (e) { console.error('esqueci-senha (cliente):', e.message); }
+});
+
+// Recuperação de senha do cliente: passo 2 (código + nova senha)
+app.post('/api/clientes/redefinir-senha', async (req, res) => {
+  try {
+    const email = normEmail(req.body.email);
+    if (!limitar(`credef:${req.ip}:${email}`, 10, 15 * 60 * 1000)) return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
+    if (req.body.senha_nova !== req.body.senha_confirmacao) return res.status(400).json({ error: 'As senhas não conferem.' });
+    const c = await dbGet(`SELECT id, usuario FROM clientes WHERE email = ? AND email_verificado = 1`, [email]);
+    const eSenha = validarSenha(req.body.senha_nova, c && c.usuario);
+    if (eSenha) return res.status(400).json({ error: eSenha });
+    const ok = c && await conferirCodigo(c.id, 'reset', req.body.codigo);
+    if (!ok) return res.status(400).json({ error: 'Código inválido ou expirado. Peça um novo código.' });
+    await dbRun(`UPDATE clientes SET senha = ? WHERE id = ?`, [await bcrypt.hash(req.body.senha_nova, 10), c.id]);
+    res.json({ message: 'Senha alterada! Entre com a nova senha.' });
+  } catch (e) { erroInterno(res, e); }
+});
+
+// ==========================================
+// PEDIDOS DO CLIENTE (exigem login; o servidor recalcula os preços)
+// ==========================================
+app.post('/api/pedidos', autenticarCliente, async (req, res) => {
+  try {
+    const itensRecebidos = Array.isArray(req.body.itens) ? req.body.itens : [];
+    if (!itensRecebidos.length || itensRecebidos.length > 100) return res.status(400).json({ error: 'Carrinho inválido.' });
+
+    const produtos = await dbAll(`SELECT nome, preco, categoria, imagem FROM produtos`);
+    const porNome = new Map(produtos.map(p => [String(p.nome).trim().toLowerCase(), p]));
+    const itens = [];
+    for (const i of itensRecebidos) {
+      const p = porNome.get(String(i && i.name || '').trim().toLowerCase());
+      const qtd = Math.floor(Number(i && i.quantity));
+      if (!p || !(qtd >= 1 && qtd <= 999)) return res.status(400).json({ error: 'Um dos produtos do carrinho não está mais disponível.' });
+      itens.push({ name: p.nome, price: Number(p.preco), category: p.categoria, image: p.imagem, quantity: qtd });
+    }
+    const subtotal = Math.round(itens.reduce((t, i) => t + i.price * i.quantity, 0) * 100) / 100;
+    const frete = subtotal >= 199 ? 0 : 15.90;
+    const total = Math.round((subtotal + frete) * 100) / 100;
+
+    const r = await dbRun(
+      `INSERT INTO pedidos (cliente_email, itens, subtotal, frete, total, data, status) VALUES (?, ?, ?, ?, ?, ?, 'aberto')`,
+      [req.cliente.email, JSON.stringify(itens), subtotal, frete, total, new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' })]
+    );
+    res.json({ id: r.lastID, subtotal, frete, total, message: 'Pedido registrado com sucesso!' });
+  } catch (e) { erroInterno(res, e); }
+});
+
+// Só o próprio cliente vê os próprios pedidos
+app.get('/api/pedidos/meus', autenticarCliente, (req, res) => {
+  db.all(`SELECT id, itens, subtotal, frete, total, data, status FROM pedidos WHERE cliente_email = ? ORDER BY id DESC`, [req.cliente.email], (err, rows) => {
+    if (err) return erroInterno(res, err);
+    res.json(rows.map(p => ({ ...p, status: p.status || 'aberto', itens: parseLista(p.itens) })));
   });
 });
 
@@ -526,7 +763,7 @@ app.get('/api/pedidos/:email', (req, res) => {
 // ==========================================
 app.get('/api/admin/pedidos', ...exigirPermissao('ver_pedidos', 'finalizar_pedidos', 'cancelar_pedidos'), (req, res) => {
   db.all(`SELECT * FROM pedidos ORDER BY id DESC`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json(rows.map(p => ({ ...p, status: p.status || 'aberto', itens: parseLista(p.itens) })));
   });
 });
@@ -541,11 +778,11 @@ app.put('/api/admin/pedidos/:id/status', autenticarAdmin, async (req, res) => {
       return res.status(403).json({ error: 'Você não tem permissão para realizar esta ação.' });
     }
     db.run(`UPDATE pedidos SET status = ? WHERE id = ?`, [status, req.params.id], (err) => {
-      if (err) return res.status(500).json({ error: err.message });
+      if (err) return erroInterno(res, err);
       res.json({ message: 'Status atualizado!' });
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    erroInterno(res, e);
   }
 });
 
@@ -554,7 +791,7 @@ app.put('/api/admin/pedidos/:id/status', autenticarAdmin, async (req, res) => {
 // ==========================================
 app.get('/api/configuracoes', (req, res) => {
   db.all(`SELECT * FROM configuracoes`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     const configObj = {};
     rows.forEach(r => {
       try { configObj[r.chave] = JSON.parse(r.valor); }
@@ -579,12 +816,12 @@ app.post('/api/configuracoes', autenticarAdmin, async (req, res) => {
       `INSERT INTO configuracoes (chave, valor) VALUES (?, ?) ON CONFLICT(chave) DO UPDATE SET valor = ?`,
       [chave, valorStr, valorStr],
       (err) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return erroInterno(res, err);
         res.json({ message: 'Configuração salva com sucesso!' });
       }
     );
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    erroInterno(res, e);
   }
 });
 
@@ -593,7 +830,7 @@ app.post('/api/configuracoes', autenticarAdmin, async (req, res) => {
 // ==========================================
 app.get('/api/banners', (req, res) => {
   db.all(`SELECT * FROM banners ORDER BY ordem ASC, id DESC`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json(rows);
   });
 });
@@ -601,14 +838,14 @@ app.get('/api/banners', (req, res) => {
 app.post('/api/banners', ...exigirPermissao('adicionar_banners'), (req, res) => {
   const { imagem, link, ordem } = req.body;
   db.run(`INSERT INTO banners (imagem, link, ordem) VALUES (?, ?, ?)`, [imagem, link || '', ordem || 0], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ id: this.lastID, message: 'Banner adicionado!' });
   });
 });
 
 app.delete('/api/banners/:id', ...exigirPermissao('remover_banners'), (req, res) => {
   db.run(`DELETE FROM banners WHERE id = ?`, [req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ message: 'Banner removido!' });
   });
 });
@@ -618,7 +855,7 @@ app.delete('/api/banners/:id', ...exigirPermissao('remover_banners'), (req, res)
 // ==========================================
 app.get('/api/categorias', (req, res) => {
   db.all(`SELECT * FROM categorias ORDER BY nome ASC`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json(rows);
   });
 });
@@ -626,7 +863,7 @@ app.get('/api/categorias', (req, res) => {
 app.post('/api/categorias', ...exigirPermissao('adicionar_categorias'), (req, res) => {
   const { nome, imagem } = req.body;
   db.run(`INSERT INTO categorias (nome, imagem) VALUES (?, ?)`, [nome, imagem || ''], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ id: this.lastID, message: 'Categoria cadastrada!' });
   });
 });
@@ -634,14 +871,14 @@ app.post('/api/categorias', ...exigirPermissao('adicionar_categorias'), (req, re
 app.put('/api/categorias/:id', ...exigirPermissao('editar_categorias'), (req, res) => {
   const { nome, imagem } = req.body;
   db.run(`UPDATE categorias SET nome = ?, imagem = ? WHERE id = ?`, [nome, imagem || '', req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ message: 'Categoria atualizada!' });
   });
 });
 
 app.delete('/api/categorias/:id', ...exigirPermissao('remover_categorias'), (req, res) => {
   db.run(`DELETE FROM categorias WHERE id = ?`, [req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ message: 'Categoria removida!' });
   });
 });
@@ -651,7 +888,7 @@ app.delete('/api/categorias/:id', ...exigirPermissao('remover_categorias'), (req
 // ==========================================
 app.get('/api/produtos', (req, res) => {
   db.all(`SELECT * FROM produtos ORDER BY id DESC`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json(rows);
   });
 });
@@ -665,7 +902,7 @@ app.post('/api/produtos', ...exigirPermissao('adicionar_produtos'), (req, res) =
     `INSERT INTO produtos (nome, preco, categoria, descricao, imagem, imagens) VALUES (?, ?, ?, ?, ?, ?)`,
     [nome, preco, categoria, descricao, imagemPrincipal, imagensJson],
     function (err) {
-      if (err) return res.status(500).json({ error: err.message });
+      if (err) return erroInterno(res, err);
       res.json({ id: this.lastID, message: 'Produto cadastrado!' });
     }
   );
@@ -680,7 +917,7 @@ app.put('/api/produtos/:id', ...exigirPermissao('editar_produtos'), (req, res) =
     `UPDATE produtos SET nome = ?, preco = ?, categoria = ?, descricao = ?, imagem = ?, imagens = ? WHERE id = ?`,
     [nome, preco, categoria, descricao, imagemPrincipal, imagensJson, req.params.id],
     (err) => {
-      if (err) return res.status(500).json({ error: err.message });
+      if (err) return erroInterno(res, err);
       res.json({ message: 'Produto atualizado!' });
     }
   );
@@ -688,7 +925,7 @@ app.put('/api/produtos/:id', ...exigirPermissao('editar_produtos'), (req, res) =
 
 app.delete('/api/produtos/:id', ...exigirPermissao('remover_produtos'), (req, res) => {
   db.run(`DELETE FROM produtos WHERE id = ?`, [req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ message: 'Produto removido!' });
   });
 });
@@ -698,7 +935,7 @@ app.delete('/api/produtos/:id', ...exigirPermissao('remover_produtos'), (req, re
 // ==========================================
 app.get('/api/cargos', ...exigirPermissao('adicionar_admin', 'editar_admin'), (req, res) => {
   db.all(`SELECT * FROM cargos ORDER BY nome ASC`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json(rows.map(r => ({ ...r, permissoes: parseLista(r.permissoes) })));
   });
 });
@@ -706,7 +943,7 @@ app.get('/api/cargos', ...exigirPermissao('adicionar_admin', 'editar_admin'), (r
 app.post('/api/cargos', ...exigirPermissao(), (req, res) => {
   const { nome, permissoes } = req.body;
   db.run(`INSERT INTO cargos (nome, permissoes) VALUES (?, ?)`, [nome, JSON.stringify(permissoes || [])], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ id: this.lastID, message: 'Cargo criado!' });
   });
 });
@@ -714,7 +951,7 @@ app.post('/api/cargos', ...exigirPermissao(), (req, res) => {
 app.put('/api/cargos/:id', ...exigirPermissao(), (req, res) => {
   const { nome, permissoes } = req.body;
   db.run(`UPDATE cargos SET nome = ?, permissoes = ? WHERE id = ?`, [nome, JSON.stringify(permissoes || []), req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ message: 'Cargo atualizado com sucesso!' });
   });
 });
@@ -728,7 +965,7 @@ app.get('/api/usuarios', ...exigirPermissao('adicionar_admin', 'editar_admin', '
      FROM usuarios u LEFT JOIN cargos c ON u.cargo_id = c.id`,
     [],
     (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
+      if (err) return erroInterno(res, err);
       res.json(rows.map(u => ({ ...u, permissoes_individuais: parseLista(u.permissoes_individuais) })));
     }
   );
@@ -738,6 +975,8 @@ app.post('/api/usuarios', ...exigirPermissao('adicionar_admin'), async (req, res
   const { usuario, senha, cargo_id, permissoes_individuais } = req.body;
   if (!usuario || !senha) return res.status(400).json({ error: 'Usuário e senha são obrigatórios.' });
   try {
+    const eUser = validarNomeUsuario(String(usuario).trim());
+    if (eUser) return res.status(400).json({ error: eUser });
     const eSenha = validarSenha(senha, usuario);
     if (eSenha) return res.status(400).json({ error: eSenha });
     const negado = await validarConcessao(req.admin, cargo_id, permissoes_individuais);
@@ -748,12 +987,12 @@ app.post('/api/usuarios', ...exigirPermissao('adicionar_admin'), async (req, res
       `INSERT INTO usuarios (usuario, senha, is_master, cargo_id, permissoes_individuais, must_change_password) VALUES (?, ?, 0, ?, ?, 1)`,
       [usuario, await bcrypt.hash(senha, 10), cargo_id || null, JSON.stringify(permissoes_individuais || [])],
       function (err) {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return erroInterno(res, err);
         res.json({ id: this.lastID, message: 'Usuário admin criado!' });
       }
     );
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    erroInterno(res, e);
   }
 });
 
@@ -802,11 +1041,11 @@ app.put('/api/usuarios/:id', autenticarAdmin, async (req, res) => {
     params.push(id);
 
     db.run(`UPDATE usuarios SET ${sets.join(', ')} WHERE id = ? AND is_master = 0`, params, (err) => {
-      if (err) return res.status(500).json({ error: err.message });
+      if (err) return erroInterno(res, err);
       res.json({ message: 'Usuário atualizado com sucesso!' });
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    erroInterno(res, e);
   }
 });
 
@@ -815,10 +1054,12 @@ app.delete('/api/usuarios/:id', ...exigirPermissao('remover_admin'), (req, res) 
     return res.status(400).json({ error: 'Você não pode excluir a si mesmo.' });
   }
   db.run(`DELETE FROM usuarios WHERE id = ? AND is_master = 0`, [req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return erroInterno(res, err);
     res.json({ message: 'Usuário removido!' });
   });
 });
+
+process.on('unhandledRejection', (e) => console.error('Promessa rejeitada:', e && e.message ? e.message : e));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));

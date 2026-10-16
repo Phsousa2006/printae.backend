@@ -95,6 +95,9 @@ const ADMIN_URL = String(process.env.ADMIN_URL || '').trim().replace(/[#?].*$/, 
 // Mostra no log (sem revelar valores) quais variáveis de e-mail estão configuradas
 const _v = (n) => (String(process.env[n] || '').trim() ? 'OK' : 'FALTANDO');
 console.log(`Config de e-mail -> ADMIN_URL: ${_v('ADMIN_URL')} | BREVO_API_KEY: ${_v('BREVO_API_KEY')} | MAIL_FROM: ${_v('MAIL_FROM')}`);
+if (process.env.RESET_MASTER_PASSWORD) {
+  console.warn('ATENÇÃO: RESET_MASTER_PASSWORD está definida. A cada reinício a senha do master volta para ela e o primeiro acesso é exigido de novo. Remova a variável depois de entrar.');
+}
 
 // ---- Limite de tentativas (em memória) ----
 const tentativas = new Map();
@@ -259,6 +262,13 @@ db.serialize(() => {
     usuario_id INTEGER NOT NULL,
     token_hash TEXT NOT NULL,
     expira_em INTEGER NOT NULL
+  )`);
+  // Código de confirmação de e-mail no primeiro acesso do master (guarda só o hash)
+  db.run(`CREATE TABLE IF NOT EXISTS admin_codigos (
+    usuario_id INTEGER PRIMARY KEY,
+    codigo_hash TEXT NOT NULL,
+    expira_em INTEGER NOT NULL,
+    tentativas INTEGER DEFAULT 0
   )`);
 
   // Roda depois das migrações acima (o serialize garante a ordem)
@@ -427,7 +437,9 @@ app.post('/api/login', async (req, res) => {
 });
 
 // Primeiro acesso.
-// MASTER: define usuário, e-mail (recuperação de senha) e senha nova.
+// MASTER: define usuário, e-mail (recuperação de senha) e senha nova. O e-mail é CONFIRMADO por código:
+//   1ª chamada (sem "codigo")  -> valida tudo e envia um código de 6 dígitos para o e-mail informado;
+//   2ª chamada (com "codigo")  -> confere o código e só então salva.
 // Demais usuários: apenas trocam a senha provisória (sem e-mail, sem mudar o usuário).
 app.post('/api/conta/primeiro-acesso', autenticarSetup, async (req, res) => {
   try {
@@ -455,6 +467,46 @@ app.post('/api/conta/primeiro-acesso', autenticarSetup, async (req, res) => {
     const eSenha = validarSenha(senhaNova, novoUsuario);
     if (eSenha) return res.status(400).json({ error: eSenha });
 
+    // MASTER: confirma o e-mail com um código de 6 dígitos antes de salvar
+    if (row.is_master) {
+      const codigo = String(req.body.codigo || '').trim();
+
+      if (!codigo) {
+        // Passo 1: gera o código, guarda só o hash (preso ao e-mail informado) e envia
+        if (!limitar(`pa-cod:${row.id}`, 5, 60 * 60 * 1000)) {
+          return res.status(429).json({ error: 'Muitos códigos solicitados. Aguarde um pouco e tente de novo.' });
+        }
+        const novo = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+        await dbRun(`DELETE FROM admin_codigos WHERE usuario_id = ?`, [row.id]);
+        await dbRun(
+          `INSERT INTO admin_codigos (usuario_id, codigo_hash, expira_em) VALUES (?, ?, ?)`,
+          [row.id, hashToken(`${row.id}:${email}:${novo}`), Date.now() + 15 * 60 * 1000]
+        );
+        const enviado = await enviarEmail(email, 'Confirme seu e-mail - Painel Printae.gyn', `
+          <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#222">
+            <h2>Confirme seu e-mail</h2>
+            <p>Use o código abaixo para confirmar este e-mail no painel administrativo:</p>
+            <p style="font-size:34px;letter-spacing:8px;font-weight:bold;background:#f3eefc;padding:14px 18px;border-radius:12px;text-align:center">${novo}</p>
+            <p style="font-size:13px;color:#555">O código vale por 15 minutos. Se não foi você, ignore este e-mail.</p>
+          </div>`);
+        if (!enviado) {
+          return res.status(502).json({ error: 'Não foi possível enviar o e-mail agora. Confira o e-mail digitado e tente novamente.' });
+        }
+        return res.json({ codigo_enviado: true, message: `Enviamos um código de 6 dígitos para ${email}. Digite-o para concluir.` });
+      }
+
+      // Passo 2: confere o código (máx. 5 tentativas, uso único, válido só para este e-mail)
+      const c = await dbGet(`SELECT codigo_hash, expira_em, tentativas FROM admin_codigos WHERE usuario_id = ?`, [row.id]);
+      if (!c || c.expira_em < Date.now() || c.tentativas >= 5) {
+        return res.status(400).json({ error: 'Código inválido ou expirado. Clique em "Reenviar código".' });
+      }
+      if (hashToken(`${row.id}:${email}:${codigo}`) !== c.codigo_hash) {
+        await dbRun(`UPDATE admin_codigos SET tentativas = tentativas + 1 WHERE usuario_id = ?`, [row.id]);
+        return res.status(400).json({ error: 'Código incorreto.' });
+      }
+      await dbRun(`DELETE FROM admin_codigos WHERE usuario_id = ?`, [row.id]);
+    }
+
     await dbRun(
       `UPDATE usuarios SET usuario = ?, email = ?, senha = ?, must_change_password = 0 WHERE id = ?`,
       [novoUsuario, email, await bcrypt.hash(senhaNova, 10), row.id]
@@ -469,6 +521,7 @@ app.post('/api/conta/primeiro-acesso', autenticarSetup, async (req, res) => {
     );
     res.json({ token, usuario: atual.usuario, is_master: atual.is_master, permissoes: atual.permissoes });
   } catch (e) {
+    console.error('Erro no primeiro acesso:', e && e.message ? e.message : e);
     res.status(500).json({ error: 'Erro interno ao concluir o primeiro acesso.' });
   }
 });
